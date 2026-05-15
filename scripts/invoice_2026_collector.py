@@ -1,0 +1,2030 @@
+#!/usr/bin/env python3
+"""Read-only QQ mailbox invoice collector for 2026 invoices.
+
+The collector is conservative:
+- read mail through IMAP only
+- download likely invoice attachments
+- recover invoice PDFs/OFDs from message links when possible
+- record link/QR evidence for manual review when automated recovery is unsafe
+- never send, delete, or move mail
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import csv
+import datetime as dt
+import email
+from email.header import decode_header
+from email.message import Message
+import hashlib
+import html
+from html.parser import HTMLParser
+import imaplib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import sqlite3
+import ssl
+import threading
+import time
+from typing import Callable, Iterable, TypeVar
+from urllib import request as urlrequest
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qsl, unquote, urljoin, urlparse
+
+from invoice_pdf_parser import (
+    build_mimo_qr_url_extractor,
+    build_mimo_vision_extractor,
+    parse_invoice_pdf_pages,
+    split_pdf_page_to_bytes,
+)
+
+
+WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+INVOICE_ROOT = WORKSPACE_ROOT / "发票整理"
+CONFIG_DIR = INVOICE_ROOT / "私密配置"
+RAW_DIR = INVOICE_ROOT / "原始附件"
+PROCESSED_DIR = INVOICE_ROOT / "已整理发票"
+MANUAL_DIR = INVOICE_ROOT / "人工复核"
+REPORT_DIR = INVOICE_ROOT / "台账"
+STATE_DIR = INVOICE_ROOT / "运行状态"
+DEFAULT_LOG_DB = STATE_DIR / "log.db"
+MAX_WORKERS = 3
+OUTPUT_LOCK = threading.Lock()
+THREAD_LOCAL = threading.local()
+
+SUBJECT_KEYWORDS = (
+    "发票",
+    "电子发票",
+    "Invoice",
+    "账单",
+    "行程单",
+)
+
+PRIORITY_SENDER_DOMAINS = (
+    "didi.com",
+    "meituan.com",
+    "trip.com",
+    "ctrip.com",
+    "qunar.com",
+    "12306.cn",
+    "railway12306.cn",
+    "apple.com",
+    "stripe.com",
+)
+
+LIKELY_INVOICE_KEYWORDS = (
+    "发票",
+    "电子发票",
+    "数电票",
+    "全电票",
+    "开票",
+    "票据",
+    "行程单",
+    "报销",
+    "invoice",
+    "receipt",
+    "tax",
+)
+
+DOWNLOAD_ATTACHMENT_EXTENSIONS = {".pdf", ".ofd"}
+SKIPPED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
+MIN_IMAGE_SIGNATURE_BYTES = 20 * 1024
+INVOICE_EXTENSIONS = {".pdf", ".ofd", ".xml"}
+URL_RE = re.compile(r"https?://[^\s\"'<>）)]+", re.IGNORECASE)
+LINK_DOWNLOAD_TIMEOUT_SECONDS = 30
+MAX_LINK_DOWNLOAD_BYTES = 25 * 1024 * 1024
+MAX_LINK_CANDIDATES_PER_MAIL = 20
+LINK_INVOICE_HINTS = (
+    "发票",
+    "下载",
+    "查看",
+    "获取",
+    "开票",
+    "pdf",
+    "ofd",
+    "xml",
+    "invoice",
+    "receipt",
+    "fapiao",
+    "download",
+    "bill",
+    "tax",
+)
+LINK_NOISE_HINTS = (
+    "unsubscribe",
+    "privacy",
+    "terms",
+    "legal",
+    "support",
+    "help",
+    "track",
+    "tracking",
+    "preference",
+    "logo",
+    "banner",
+)
+DECORATIVE_IMAGE_NAME_HINTS = (
+    "logo",
+    "banner",
+    "icon",
+    "footer",
+    "header",
+    "signature",
+    "avatar",
+    "sprite",
+)
+QR_HINTS = ("二维码", "扫码", "扫一扫", "QR", "qr", "qrcode", "领取发票", "下载发票")
+T = TypeVar("T")
+
+
+class _AnchorLinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[tuple[str, str]] = []
+        self._current_href = ""
+        self._current_text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        attr_map = {key.lower(): value or "" for key, value in attrs}
+        self._current_href = attr_map.get("href", "")
+        self._current_text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._current_href:
+            self._current_text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "a" or not self._current_href:
+            return
+        anchor_text = re.sub(r"\s+", " ", "".join(self._current_text)).strip()
+        self.links.append((self._current_href, anchor_text))
+        self._current_href = ""
+        self._current_text = []
+
+
+class _ImageSourceParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.images: list[dict[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "img":
+            return
+        attr_map = {key.lower(): value or "" for key, value in attrs}
+        src = attr_map.get("src", "").strip()
+        if not src:
+            return
+        self.images.append(
+            {
+                "src": src,
+                "alt": attr_map.get("alt", ""),
+                "title": attr_map.get("title", ""),
+            }
+        )
+
+
+class PlainProgress:
+    def __init__(self, total: int, desc: str = ""):
+        self.total = total
+        self.desc = desc
+        self.count = 0
+
+    def __enter__(self) -> "PlainProgress":
+        if self.desc:
+            print(f"{self.desc}: 0/{self.total}")
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        pass
+
+    def update(self, value: int = 1) -> None:
+        self.count += value
+        if self.count == self.total or self.count % 25 == 0:
+            print(f"{self.desc}: {self.count}/{self.total}")
+
+    def set_postfix(self, *_args: object, **_kwargs: object) -> None:
+        pass
+
+
+def make_progress(total: int, desc: str):
+    try:
+        from tqdm import tqdm  # type: ignore
+
+        return tqdm(total=total, desc=desc, unit="mail")
+    except Exception:
+        return PlainProgress(total=total, desc=desc)
+
+
+def retry_call(
+    func: Callable[[], T],
+    *,
+    attempts: int = 3,
+    sleep_seconds: float = 2.0,
+    label: str = "operation",
+) -> T:
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return func()
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                break
+            print(f"{label} failed on attempt {attempt}/{attempts}; retrying...")
+            time.sleep(sleep_seconds * attempt)
+    assert last_exc is not None
+    raise last_exc
+
+
+def load_env(path: Path | None) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if path and path.exists():
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip('"').strip("'")
+    merged = dict(os.environ)
+    merged.update(values)
+    return merged
+
+
+def decode_mime_words(value: str | None) -> str:
+    if not value:
+        return ""
+    if not isinstance(value, str):
+        value = str(value)
+    parts = []
+    for data, charset in decode_header(value):
+        if isinstance(data, bytes):
+            charset = charset or "utf-8"
+            try:
+                parts.append(data.decode(charset, errors="replace"))
+            except LookupError:
+                parts.append(data.decode("utf-8", errors="replace"))
+        else:
+            parts.append(data)
+    return "".join(parts).strip()
+
+
+def safe_name(value: str, default: str = "unnamed") -> str:
+    text = decode_mime_words(value) or default
+    text = html.unescape(text)
+    text = re.sub(r"[\\/:*?\"<>|\r\n\t]+", "_", text)
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    return text[:160] or default
+
+
+def parse_date(value: str | None) -> str:
+    if not value:
+        return ""
+    value_text = decode_mime_words(value)
+    try:
+        parsed = email.utils.parsedate_to_datetime(value_text)
+        if parsed.tzinfo:
+            parsed = parsed.astimezone(dt.timezone(dt.timedelta(hours=8)))
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return value_text[:80]
+
+
+def date_to_imap(value: str) -> str:
+    parsed = dt.datetime.strptime(value, "%Y-%m-%d").date()
+    return parsed.strftime("%d-%b-%Y")
+
+
+def next_date(value: str) -> str:
+    parsed = dt.datetime.strptime(value, "%Y-%m-%d").date()
+    return (parsed + dt.timedelta(days=1)).isoformat()
+
+
+def part_filename(part: Message) -> str:
+    filename = part.get_filename()
+    if filename:
+        return safe_name(filename)
+    content_type = part.get_content_type()
+    ext = {
+        "application/pdf": ".pdf",
+        "application/xml": ".xml",
+        "text/xml": ".xml",
+        "application/zip": ".zip",
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+    }.get(content_type, "")
+    return f"attachment{ext}"
+
+
+def encoded_payload_size(part: Message) -> int:
+    size_value = part.get_param("size", header="content-disposition")
+    if size_value:
+        try:
+            return int(str(size_value))
+        except ValueError:
+            pass
+    payload = part.get_payload(decode=False)
+    if isinstance(payload, bytes):
+        return len(payload)
+    if isinstance(payload, str):
+        compact = re.sub(r"\s+", "", payload)
+        return int(math.ceil(len(compact) * 0.75))
+    return 0
+
+
+def should_download_attachment(part: Message, filename: str) -> bool:
+    name = filename or part_filename(part)
+    ext = Path(name).suffix.lower()
+    content_type = (part.get_content_type() or "").lower()
+    estimated_size = encoded_payload_size(part)
+
+    if content_type.startswith("image/") or ext in SKIPPED_IMAGE_EXTENSIONS:
+        if estimated_size and estimated_size < MIN_IMAGE_SIGNATURE_BYTES:
+            return False
+        if not any(token in name for token in ("发票", "Invoice", "invoice")):
+            return False
+
+    return ext in DOWNLOAD_ATTACHMENT_EXTENSIONS or "发票" in name or "Invoice" in name or "invoice" in name
+
+
+def get_text_parts(msg: Message) -> tuple[str, str]:
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        content_type = part.get_content_type()
+        if content_type not in {"text/plain", "text/html"}:
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            text = payload.decode(charset, errors="replace")
+        except LookupError:
+            text = payload.decode("utf-8", errors="replace")
+        if content_type == "text/html":
+            html_parts.append(text)
+        else:
+            plain_parts.append(text)
+    return "\n".join(plain_parts), "\n".join(html_parts)
+
+
+def looks_invoice_related(*texts: str) -> bool:
+    combined = " ".join(t or "" for t in texts).lower()
+    return any(keyword.lower() in combined for keyword in LIKELY_INVOICE_KEYWORDS)
+
+
+def subject_has_invoice_keyword(subject: str) -> bool:
+    subject_lower = (subject or "").lower()
+    return any(keyword.lower() in subject_lower for keyword in SUBJECT_KEYWORDS)
+
+
+def extract_urls(*texts: str) -> list[str]:
+    seen = set()
+    urls = []
+    for text in texts:
+        for match in URL_RE.findall(html.unescape(text or "")):
+            clean = match.rstrip(".,;，。；")
+            if clean not in seen:
+                seen.add(clean)
+                urls.append(clean)
+    return urls
+
+
+def normalize_invoice_link(url: str, base_url: str = "") -> str:
+    value = html.unescape(str(url or "")).strip()
+    if not value or value.startswith(("mailto:", "tel:", "javascript:")):
+        return ""
+    if base_url:
+        value = urljoin(base_url, value)
+    parsed = urlparse(value)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return ""
+    for key, query_value in parse_qsl(parsed.query, keep_blank_values=True):
+        if key.lower() in {"pdfurl", "url", "target", "redirect"} and query_value.startswith(("http://", "https://")):
+            return unquote(query_value).strip()
+    return value.rstrip(".,;，。；")
+
+
+def extract_link_candidates(plain: str, html_text: str) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    seen_urls: set[str] = set()
+
+    def add(url: str, anchor_text: str = "") -> None:
+        normalized = normalize_invoice_link(url)
+        if not normalized:
+            return
+        key = (normalized, anchor_text.lower().strip())
+        if key in seen:
+            return
+        seen.add(key)
+        seen_urls.add(normalized)
+        candidates.append({"url": normalized, "anchor_text": anchor_text.strip()})
+
+    parser = _AnchorLinkParser()
+    try:
+        parser.feed(html_text or "")
+    except Exception:
+        parser.links = []
+    for href, anchor_text in parser.links:
+        add(href, anchor_text)
+    for text in (plain, html_text):
+        for url in extract_urls(text):
+            normalized = normalize_invoice_link(url)
+            if normalized and normalized not in seen_urls:
+                add(normalized, "")
+    return candidates
+
+
+def detect_link_platform(url: str, sender: str = "", subject: str = "") -> str:
+    del sender, subject
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if any(token in host for token in ("nfp.jss.com.cn", "jss.com.cn", "nuonuo.com")):
+        return "诺诺网/JSS"
+    if any(token in host for token in ("baiwang", "efapiao.com", "bwjf.cn")):
+        return "百望/票通"
+    if "chinatax.gov.cn" in host:
+        return "税务平台直链"
+    if "apple.com" in host:
+        return "Apple"
+    if any(token in host for token in ("didi.com", "didichuxing.com")):
+        return "滴滴"
+    if "meituan.com" in host:
+        return "美团"
+    if any(token in host for token in ("trip.com", "ctrip.com")):
+        return "携程/Trip"
+    if any(token in host for token in ("12306", "railway")):
+        return "12306"
+    return "未知平台"
+
+
+def link_has_invoice_signal(candidate: dict[str, str], subject: str, sender: str, body_text: str) -> bool:
+    url = candidate.get("url", "")
+    anchor_text = candidate.get("anchor_text", "")
+    link_text = f"{url} {anchor_text}".lower()
+    context_text = f"{subject} {sender} {body_text[:1000]}".lower()
+    parsed = urlparse(url)
+    ext = Path(parsed.path).suffix.lower()
+    platform = detect_link_platform(url, sender, subject)
+    if ext in INVOICE_EXTENSIONS:
+        return True
+    has_link_hint = any(hint.lower() in link_text for hint in LINK_INVOICE_HINTS)
+    if platform in {"诺诺网/JSS", "百望/票通", "税务平台直链"}:
+        return True
+    if platform != "未知平台" and has_link_hint:
+        return True
+    return has_link_hint
+
+
+def is_noise_link(candidate: dict[str, str], subject: str, sender: str, body_text: str) -> bool:
+    url = candidate.get("url", "")
+    anchor_text = candidate.get("anchor_text", "")
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    combined = f"{url} {anchor_text}".lower()
+    mail_context = f"{subject} {sender} {body_text}".lower()
+    if any(hint in combined for hint in LINK_NOISE_HINTS):
+        return True
+    if host in {"ns.adobe.com", "purl.org"}:
+        return True
+    if host in {"wx.mail.qq.com", "support.apple.com", "www.apple.com", "apple.com"} and any(part in path for part in ("/legal", "/privacy", "/support")):
+        return True
+    if host in {"account.apple.com", "apps.apple.com"} and not any(token in combined for token in ("invoice", "发票", "receipt", "账单")):
+        return True
+    if link_has_invoice_signal(candidate, subject, sender, body_text):
+        return False
+    return "发票" not in mail_context and "invoice" not in mail_context
+
+
+def select_invoice_link_candidates(
+    candidates: list[dict[str, str]],
+    subject: str,
+    sender: str,
+    body_text: str,
+) -> list[dict[str, str]]:
+    selected: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for candidate in candidates:
+        url = candidate.get("url", "")
+        if not url or url in seen_urls:
+            continue
+        if is_noise_link(candidate, subject, sender, body_text):
+            continue
+        if not link_has_invoice_signal(candidate, subject, sender, body_text):
+            continue
+        seen_urls.add(url)
+        enriched = dict(candidate)
+        enriched["platform"] = detect_link_platform(url, sender, subject)
+        selected.append(enriched)
+    selected.sort(key=lambda item: link_candidate_priority(item))
+    return selected[:MAX_LINK_CANDIDATES_PER_MAIL]
+
+
+def link_candidate_priority(candidate: dict[str, str]) -> tuple[int, str]:
+    url = candidate.get("url", "").lower()
+    anchor = candidate.get("anchor_text", "").lower()
+    ext = Path(urlparse(url).path).suffix.lower()
+    if ext in {".pdf", ".ofd", ".xml"}:
+        return (0, url)
+    if any(token in url for token in ("downloadpdf", "downloadofd", "downloadxml", "wjgs=pdf", "jflx=pdf")):
+        return (1, url)
+    if any(token in f"{url} {anchor}" for token in ("下载", "download", "发票", "invoice")):
+        return (2, url)
+    return (3, url)
+
+
+def make_link_headers(env: dict[str, str]) -> dict[str, str]:
+    return {
+        "User-Agent": env.get("LINK_USER_AGENT") or env.get("MIMO_USER_AGENT") or "InvoiceCollector/1.0 (Local; Python)",
+        "Accept": "application/pdf,application/xml,application/ofd,application/octet-stream,text/html;q=0.9,*/*;q=0.8",
+    }
+
+
+def infer_download_extension(url: str, content_type: str, content_disposition: str, data: bytes) -> str:
+    combined = f"{url} {content_type} {content_disposition}".lower()
+    if data.startswith(b"%PDF") or "application/pdf" in combined or ".pdf" in combined or "wjgs=pdf" in combined or "jflx=pdf" in combined:
+        return ".pdf"
+    if "ofd" in combined or ".ofd" in combined or "wjgs=ofd" in combined or "jflx=ofd" in combined:
+        return ".ofd"
+    if data.lstrip().startswith(b"<?xml") or "xml" in combined or ".xml" in combined or "wjgs=xml" in combined:
+        return ".xml"
+    return ""
+
+
+def read_limited_response(response: object, limit: int = MAX_LINK_DOWNLOAD_BYTES) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = response.read(1024 * 512)  # type: ignore[attr-defined]
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise RuntimeError("download_too_large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def fetch_url_bytes(url: str, env: dict[str, str], retry_attempts: int, retry_sleep: float) -> tuple[bytes, str, str, str]:
+    headers = make_link_headers(env)
+
+    def once() -> tuple[bytes, str, str, str]:
+        import httpx
+
+        with httpx.Client(
+            follow_redirects=True,
+            headers=headers,
+            timeout=LINK_DOWNLOAD_TIMEOUT_SECONDS,
+            trust_env=False,
+        ) as client:
+            response = client.get(url)
+            response.raise_for_status()
+            data = response.content
+        if len(data) > MAX_LINK_DOWNLOAD_BYTES:
+            raise RuntimeError("download_too_large")
+        content_type = str(response.headers.get("Content-Type") or "")
+        disposition = str(response.headers.get("Content-Disposition") or "")
+        resolved_url = str(response.url or url)
+        return data, content_type, disposition, resolved_url
+
+    return retry_call(once, attempts=retry_attempts, sleep_seconds=retry_sleep, label=f"link download {urlparse(url).netloc}")
+
+
+def save_downloaded_artifact(data: bytes, target_dir: Path, filename: str, prefix: str, ext: str) -> Path:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    safe_filename = safe_name(filename, f"{prefix}{ext}")
+    if not Path(safe_filename).suffix and ext:
+        safe_filename = f"{safe_filename}{ext}"
+    if ext and Path(safe_filename).suffix.lower() != ext:
+        safe_filename = f"{Path(safe_filename).stem}{ext}"
+    target = target_dir / f"{prefix}_{safe_filename}"
+    counter = 2
+    while target.exists():
+        target = target_dir / f"{prefix}_{counter}_{safe_filename}"
+        counter += 1
+    target.write_bytes(data)
+    return target
+
+
+def html_candidate_links(data: bytes, base_url: str) -> list[dict[str, str]]:
+    text = data.decode("utf-8", errors="replace")
+    parser = _AnchorLinkParser()
+    try:
+        parser.feed(text)
+    except Exception:
+        parser.links = []
+    candidates = [{"url": href, "anchor_text": anchor_text} for href, anchor_text in parser.links]
+    for url in extract_urls(text):
+        candidates.append({"url": url, "anchor_text": ""})
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        url = normalize_invoice_link(candidate.get("url", ""), base_url=base_url)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        normalized.append({"url": url, "anchor_text": candidate.get("anchor_text", "")})
+    return normalized
+
+
+def save_response_artifact(
+    response_url: str,
+    content_disposition: str,
+    data: bytes,
+    target_dir: Path,
+    prefix: str,
+    ext: str,
+) -> tuple[Path, str]:
+    match = re.search(r"filename\*?=(?:UTF-8''|\"?)([^\";]+)", content_disposition, flags=re.IGNORECASE)
+    if match:
+        filename = safe_name(unquote(match.group(1)))
+    else:
+        path_name = Path(urlparse(response_url).path).name
+        filename = safe_name(path_name, f"invoice_link{ext}") if path_name else f"invoice_link{ext}"
+    saved = save_downloaded_artifact(data, target_dir, filename, prefix, ext)
+    return saved, filename
+
+
+def download_invoice_links(
+    candidates: list[dict[str, str]],
+    env: dict[str, str],
+    target_dir: Path,
+    prefix: str,
+    retry_attempts: int,
+    retry_sleep: float,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    artifacts: list[dict[str, str]] = []
+    unresolved: list[dict[str, str]] = []
+    queued = list(candidates)
+    seen: set[str] = set()
+
+    while queued and len(seen) < MAX_LINK_CANDIDATES_PER_MAIL * 2:
+        candidate = queued.pop(0)
+        url = candidate.get("url", "")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        platform = candidate.get("platform") or detect_link_platform(url)
+        try:
+            data, content_type, disposition, resolved_url = fetch_url_bytes(url, env, retry_attempts, retry_sleep)
+            ext = infer_download_extension(resolved_url, content_type, disposition, data)
+            if ext:
+                saved, filename = save_response_artifact(resolved_url, disposition, data, target_dir, prefix, ext)
+                artifacts.append(
+                    {
+                        "path": str(saved),
+                        "original_name": filename,
+                        "source_url": url,
+                        "resolved_url": resolved_url,
+                        "platform": platform,
+                        "status": "Link_Downloaded",
+                    }
+                )
+                continue
+
+            if "html" in content_type.lower() or b"<html" in data[:500].lower():
+                nested = select_invoice_link_candidates(
+                    html_candidate_links(data, resolved_url),
+                    "",
+                    platform,
+                    data.decode("utf-8", errors="replace")[:5000],
+                )
+                for nested_candidate in nested:
+                    nested_candidate.setdefault("platform", platform)
+                    if nested_candidate.get("url") not in seen:
+                        queued.append(nested_candidate)
+                if nested:
+                    continue
+
+            unresolved.append(
+                {
+                    "url": url,
+                    "platform": platform,
+                    "status": "Link_Need_Manual",
+                    "note": f"链接可访问但没有发现 PDF/OFD/XML 下载结果；Content-Type={content_type[:80]}",
+                }
+            )
+        except Exception as exc:
+            unresolved.append(
+                {
+                    "url": url,
+                    "platform": platform,
+                    "status": "Link_Need_Manual",
+                    "note": f"自动下载失败，需要人工打开确认：{str(exc)[:180]}",
+                }
+            )
+
+    return artifacts, unresolved
+
+
+def html_image_sources(html_text: str) -> list[dict[str, str]]:
+    parser = _ImageSourceParser()
+    try:
+        parser.feed(html_text or "")
+    except Exception:
+        return []
+    return parser.images
+
+
+def message_content_id_map(msg: Message) -> dict[str, Message]:
+    result: dict[str, Message] = {}
+    for part in msg.walk():
+        content_id = str(part.get("Content-ID") or "").strip().strip("<>")
+        if content_id:
+            result[content_id] = part
+    return result
+
+
+def decode_data_url_image(src: str) -> tuple[bytes, str] | None:
+    match = re.match(r"data:(image/[a-zA-Z0-9.+-]+);base64,(.+)", src, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        return base64.b64decode(match.group(2), validate=False), match.group(1)
+    except Exception:
+        return None
+
+
+def image_bytes_to_data_url(data: bytes, content_type: str) -> str:
+    mime = content_type if content_type.startswith("image/") else "image/png"
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def has_qr_context(*texts: str) -> bool:
+    combined = " ".join(texts)
+    return any(hint in combined for hint in QR_HINTS)
+
+
+def is_decorative_image_name(name: str) -> bool:
+    lower_name = name.lower()
+    return any(hint in lower_name for hint in DECORATIVE_IMAGE_NAME_HINTS)
+
+
+def add_qr_candidate(
+    candidates: list[dict[str, object]],
+    seen_hashes: set[str],
+    *,
+    data: bytes,
+    content_type: str,
+    filename: str,
+    source: str,
+) -> None:
+    if not data or len(data) < 512:
+        return
+    digest = hashlib.sha256(data).hexdigest()
+    if digest in seen_hashes:
+        return
+    seen_hashes.add(digest)
+    candidates.append(
+        {
+            "data": data,
+            "content_type": content_type or "image/png",
+            "filename": safe_name(filename, "qr_clue.png"),
+            "source": source,
+        }
+    )
+
+
+def collect_qr_image_candidates(
+    msg: Message,
+    plain: str,
+    html_text: str,
+    env: dict[str, str],
+    retry_attempts: int,
+    retry_sleep: float,
+) -> list[dict[str, object]]:
+    qr_context = has_qr_context(plain, html_text)
+    if not qr_context:
+        return []
+
+    candidates: list[dict[str, object]] = []
+    seen_hashes: set[str] = set()
+    cid_parts = message_content_id_map(msg)
+
+    for image in html_image_sources(html_text):
+        src = image.get("src", "").strip()
+        hint_text = f"{src} {image.get('alt', '')} {image.get('title', '')}"
+        if not has_qr_context(hint_text, plain, html_text):
+            continue
+        data_url = decode_data_url_image(src)
+        if data_url:
+            data, content_type = data_url
+            add_qr_candidate(candidates, seen_hashes, data=data, content_type=content_type, filename="html_base64_qr.png", source="html_base64")
+            continue
+        if src.lower().startswith("cid:"):
+            cid = src[4:].strip().strip("<>")
+            part = cid_parts.get(cid)
+            if part:
+                payload = part.get_payload(decode=True) or b""
+                add_qr_candidate(
+                    candidates,
+                    seen_hashes,
+                    data=payload,
+                    content_type=part.get_content_type() or "image/png",
+                    filename=part_filename(part),
+                    source=f"cid:{cid}",
+                )
+            continue
+        normalized_src = normalize_invoice_link(src)
+        if normalized_src and (has_qr_context(hint_text) or detect_link_platform(normalized_src) != "未知平台"):
+            try:
+                data, content_type, _disposition, resolved_url = fetch_url_bytes(normalized_src, env, retry_attempts, retry_sleep)
+                if content_type.lower().startswith("image/"):
+                    add_qr_candidate(
+                        candidates,
+                        seen_hashes,
+                        data=data,
+                        content_type=content_type,
+                        filename=Path(urlparse(resolved_url).path).name or "remote_qr.png",
+                        source=resolved_url,
+                    )
+            except Exception:
+                continue
+
+    for part in msg.walk():
+        content_type = (part.get_content_type() or "").lower()
+        if not content_type.startswith("image/"):
+            continue
+        filename = part_filename(part)
+        if is_decorative_image_name(filename):
+            continue
+        payload = part.get_payload(decode=True) or b""
+        add_qr_candidate(
+            candidates,
+            seen_hashes,
+            data=payload,
+            content_type=content_type,
+            filename=filename,
+            source="mail_image_part",
+        )
+
+    return candidates
+
+
+def save_qr_clue_candidate(candidate: dict[str, object], prefix: str) -> Path:
+    target_dir = MANUAL_DIR / "二维码线索"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    filename = safe_name(str(candidate.get("filename") or "qr_clue.png"), "qr_clue.png")
+    target = target_dir / f"{prefix}_{filename}"
+    counter = 2
+    while target.exists():
+        target = target_dir / f"{prefix}_{counter}_{filename}"
+        counter += 1
+    target.write_bytes(candidate.get("data") if isinstance(candidate.get("data"), bytes) else b"")
+    return target
+
+
+def recover_qr_invoice_links(
+    qr_candidates: list[dict[str, object]],
+    qr_url_extract: Callable[[list[str]], str] | None,
+    env: dict[str, str],
+    target_dir: Path,
+    prefix: str,
+    retry_attempts: int,
+    retry_sleep: float,
+    subject: str,
+    sender: str,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    artifacts: list[dict[str, str]] = []
+    unresolved: list[dict[str, str]] = []
+    if not qr_candidates:
+        return artifacts, unresolved
+
+    if not qr_url_extract:
+        for candidate in qr_candidates:
+            saved = save_qr_clue_candidate(candidate, prefix)
+            unresolved.append(
+                {
+                    "url": str(saved),
+                    "platform": "",
+                    "status": "QR_Need_Manual",
+                    "note": "未配置视觉二维码解析器，二维码图片已保存到人工复核。",
+                }
+            )
+        return artifacts, unresolved
+
+    for index, candidate in enumerate(qr_candidates, start=1):
+        data = candidate.get("data")
+        if not isinstance(data, bytes):
+            continue
+        content_type = str(candidate.get("content_type") or "image/png")
+        try:
+            qr_url = qr_url_extract([image_bytes_to_data_url(data, content_type)]).strip()
+        except Exception as exc:
+            qr_url = ""
+            error_note = f"视觉模型识别二维码失败：{str(exc)[:180]}"
+        else:
+            error_note = "视觉模型未能识别出二维码 URL。"
+
+        qr_url = normalize_invoice_link(qr_url)
+        if not qr_url:
+            saved = save_qr_clue_candidate(candidate, f"{prefix}_{index}")
+            unresolved.append(
+                {
+                    "url": str(saved),
+                    "platform": "",
+                    "status": "QR_Need_Manual",
+                    "note": error_note,
+                }
+            )
+            continue
+
+        link_candidate = {
+            "url": qr_url,
+            "anchor_text": "二维码识别",
+            "platform": detect_link_platform(qr_url, sender, subject),
+        }
+        downloaded, failed = download_invoice_links(
+            [link_candidate],
+            env,
+            target_dir,
+            f"{prefix}_{index}",
+            retry_attempts,
+            retry_sleep,
+        )
+        if downloaded:
+            artifacts.extend(downloaded)
+            continue
+
+        saved = save_qr_clue_candidate(candidate, f"{prefix}_{index}")
+        note = failed[0].get("note", "二维码 URL 下载失败，需要人工确认。") if failed else "二维码 URL 下载失败，需要人工确认。"
+        unresolved.append(
+            {
+                "url": qr_url,
+                "platform": link_candidate.get("platform", ""),
+                "status": "QR_Need_Manual",
+                "note": f"{note} 已保存二维码图片：{saved}",
+            }
+        )
+
+    return artifacts, unresolved
+
+
+def maybe_save_qr_clues(msg: Message, target_dir: Path, prefix: str, plain: str, html_text: str) -> list[Path]:
+    qr_hint = any(token in f"{plain} {html_text}" for token in ("二维码", "扫码", "扫一扫", "QR", "qr"))
+    if not qr_hint:
+        return []
+    target_dir = MANUAL_DIR / "二维码线索"
+    saved: list[Path] = []
+    for part in msg.walk():
+        content_type = (part.get_content_type() or "").lower()
+        filename = part_filename(part)
+        ext = Path(filename).suffix.lower()
+        if not (content_type.startswith("image/") or ext in SKIPPED_IMAGE_EXTENSIONS):
+            continue
+        if any(hint in filename.lower() for hint in DECORATIVE_IMAGE_NAME_HINTS):
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload or len(payload) < MIN_IMAGE_SIGNATURE_BYTES:
+            continue
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / f"{prefix}_{safe_name(filename, 'qr_clue')}"
+        counter = 2
+        while target.exists():
+            target = target_dir / f"{prefix}_{counter}_{safe_name(filename, 'qr_clue')}"
+            counter += 1
+        target.write_bytes(payload)
+        saved.append(target)
+    return saved
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def save_attachment(part: Message, target_dir: Path, prefix: str) -> tuple[Path, str] | None:
+    filename = part_filename(part)
+    if not should_download_attachment(part, filename):
+        return None
+    payload = part.get_payload(decode=True)
+    if not payload:
+        return None
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{prefix}_{filename}"
+    counter = 2
+    while target.exists():
+        target = target_dir / f"{prefix}_{counter}_{filename}"
+        counter += 1
+    target.write_bytes(payload)
+    return target, filename
+
+
+class ProcessLog:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(self.db_path))
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_messages (
+                mailbox TEXT NOT NULL,
+                uid TEXT NOT NULL,
+                status TEXT NOT NULL,
+                records_count INTEGER NOT NULL DEFAULT 0,
+                processed_at TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (mailbox, uid)
+            )
+            """
+        )
+        self.conn.commit()
+
+    def is_processed(self, mailbox: str, uid: bytes | str) -> bool:
+        uid_text = uid.decode("ascii", errors="replace") if isinstance(uid, bytes) else str(uid)
+        row = self.conn.execute(
+            "SELECT 1 FROM processed_messages WHERE mailbox = ? AND uid = ?",
+            (mailbox, uid_text),
+        ).fetchone()
+        return row is not None
+
+    def mark(self, mailbox: str, uid: bytes | str, status: str, records_count: int = 0, error: str = "") -> None:
+        uid_text = uid.decode("ascii", errors="replace") if isinstance(uid, bytes) else str(uid)
+        self.conn.execute(
+            """
+            INSERT INTO processed_messages (mailbox, uid, status, records_count, processed_at, error)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(mailbox, uid) DO UPDATE SET
+                status = excluded.status,
+                records_count = excluded.records_count,
+                processed_at = excluded.processed_at,
+                error = excluded.error
+            """,
+            (mailbox, uid_text, status, int(records_count), dt.datetime.now().isoformat(timespec="seconds"), error[:500]),
+        )
+        self.conn.commit()
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+def parse_internal_date(metadata: object, fallback: str) -> str:
+    if isinstance(metadata, bytes):
+        parsed = imaplib.Internaldate2tuple(metadata)
+        if parsed:
+            return dt.datetime.fromtimestamp(time.mktime(parsed)).strftime("%Y-%m-%d %H:%M:%S")
+    return fallback
+
+
+def uid_sort_key(uid: bytes | str) -> int:
+    uid_text = uid.decode("ascii", errors="ignore") if isinstance(uid, bytes) else str(uid)
+    try:
+        return int(uid_text)
+    except ValueError:
+        return 0
+
+
+def imap_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def uid_search(
+    mail: imaplib.IMAP4_SSL,
+    criterion: str | list[str | bytes],
+    *,
+    retry_attempts: int,
+    retry_sleep: float,
+    label: str,
+    use_utf8: bool = False,
+) -> set[bytes]:
+    if isinstance(criterion, list):
+        args: tuple[object, ...] = (None, *criterion)
+    else:
+        args = ("CHARSET", "UTF-8", criterion.encode("utf-8")) if use_utf8 else (None, criterion)
+    typ, data = retry_call(
+        lambda: mail.uid("SEARCH", *args),
+        attempts=retry_attempts,
+        sleep_seconds=retry_sleep,
+        label=label,
+    )
+    if typ != "OK":
+        raise RuntimeError(f"{label} failed: {typ}")
+    return set(data[0].split()) if data and data[0] else set()
+
+
+def search_invoice_candidate_uids(
+    mail: imaplib.IMAP4_SSL,
+    *,
+    since: str,
+    until: str,
+    retry_attempts: int,
+    retry_sleep: float,
+    limit: int | None,
+) -> list[bytes]:
+    since_atom = date_to_imap(since)
+    before_atom = date_to_imap(next_date(until))
+    date_uids = uid_search(
+        mail,
+        ["SINCE", since_atom, "BEFORE", before_atom],
+        retry_attempts=retry_attempts,
+        retry_sleep=retry_sleep,
+        label="IMAP date search",
+    )
+    subject_uids: set[bytes] = set()
+    priority_uids: set[bytes] = set()
+
+    for keyword in SUBJECT_KEYWORDS:
+        use_utf8 = any(ord(char) > 127 for char in keyword)
+        try:
+            subject_uids.update(
+                uid_search(
+                    mail,
+                    f"(SUBJECT {imap_quote(keyword)})",
+                    retry_attempts=retry_attempts,
+                    retry_sleep=retry_sleep,
+                    label=f"IMAP subject search {keyword}",
+                    use_utf8=use_utf8,
+                )
+            )
+        except Exception as exc:
+            print(f"Sample Calibration filter warning: subject keyword '{keyword}' skipped by IMAP server: {exc}")
+
+    for domain in PRIORITY_SENDER_DOMAINS:
+        try:
+            priority_uids.update(
+                uid_search(
+                    mail,
+                    f"(FROM {imap_quote(domain)})",
+                    retry_attempts=retry_attempts,
+                    retry_sleep=retry_sleep,
+                    label=f"IMAP sender search {domain}",
+                )
+            )
+        except Exception as exc:
+            print(f"Sample Calibration filter warning: sender domain '{domain}' skipped by IMAP server: {exc}")
+
+    candidate_uids = date_uids & subject_uids
+    priority_sorted = sorted(candidate_uids & priority_uids, key=uid_sort_key)
+    other_sorted = sorted(candidate_uids - priority_uids, key=uid_sort_key)
+    ordered = sorted(candidate_uids, key=uid_sort_key, reverse=True)
+    if limit:
+        priority_latest = list(reversed(priority_sorted[-limit:]))
+        remaining = max(limit - len(priority_latest), 0)
+        other_latest = list(reversed(other_sorted[-remaining:])) if remaining else []
+        ordered = priority_latest + other_latest
+
+    print(
+        "Sample Calibration IMAP filter: "
+        f"date_matches={len(date_uids)}, subject_matches={len(subject_uids)}, "
+        f"priority_sender_matches={len(priority_uids)}, candidates={len(candidate_uids)}"
+    )
+    return ordered
+
+
+def write_invoice_output(path: Path, fields: dict[str, str], payload: bytes | None = None, page_number: int | None = None) -> tuple[Path, str]:
+    required = ("invoice_date", "seller", "amount")
+    if any(not fields.get(key) for key in required):
+        target_dir = MANUAL_DIR
+        status = "Need_Review"
+    else:
+        target_dir = PROCESSED_DIR / safe_name(fields.get("category", "其他"), "其他")
+        status = "Parsed"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    date = fields.get("invoice_date", "未知日期").replace("/", "-")
+    seller = safe_name(fields.get("seller", "未知开票方"))
+    amount = safe_name(fields.get("amount", "0.00"))
+    number = safe_name(fields.get("invoice_number", "无号码"))
+    page_suffix = f"_p{page_number:03d}" if page_number else ""
+    target = target_dir / f"{date}_{seller}_{amount}_{number}{page_suffix}{path.suffix.lower()}"
+    counter = 2
+    while target.exists():
+        target = target_dir / f"{date}_{seller}_{amount}_{number}{page_suffix}_{counter}{path.suffix.lower()}"
+        counter += 1
+    if payload is not None:
+        target.write_bytes(payload)
+    else:
+        shutil.copy2(path, target)
+    return target, status
+
+
+def copy_to_manual_subfolder(path: Path, subfolder: str) -> Path:
+    target_dir = MANUAL_DIR / subfolder
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / path.name
+    counter = 2
+    while target.exists():
+        target = target_dir / f"{path.stem}_{counter}{path.suffix}"
+        counter += 1
+    shutil.copy2(path, target)
+    return target
+
+
+def blank_manifest_row(
+    *,
+    status: str,
+    subject: str,
+    sender: str,
+    sent_at: str,
+    received_at: str,
+    uid_text: str,
+    links: list[str] | str = "",
+    note: str = "",
+    acquisition_method: str = "",
+    link_platform: str = "",
+    link_status: str = "",
+) -> dict[str, str]:
+    return {
+        "status": status,
+        "parse_status": "",
+        "parse_engine": "",
+        "page_number": "",
+        "page_count": "",
+        "mail_subject": subject,
+        "mail_from": sender,
+        "mail_date": sent_at,
+        "mail_received_at": received_at,
+        "source_uid": uid_text,
+        "attachment_original_name": "",
+        "original_file": "",
+        "output_file": "",
+        "sha256": "",
+        "invoice_date": "",
+        "seller": "",
+        "purchaser": "",
+        "amount": "",
+        "invoice_code": "",
+        "invoice_number": "",
+        "invoice_kind": "",
+        "category": "",
+        "links": " | ".join(links) if isinstance(links, list) else links,
+        "note": note,
+        "acquisition_method": acquisition_method,
+        "link_platform": link_platform,
+        "link_status": link_status,
+    }
+
+
+def rows_for_saved_artifact(
+    saved: Path,
+    attachment_original_name: str,
+    *,
+    subject: str,
+    sender: str,
+    sent_at: str,
+    received_at: str,
+    uid_text: str,
+    discovered_links: list[str],
+    vision_extract: Callable[[list[str], str], dict[str, str]] | None,
+    acquisition_method: str,
+    link_platform: str = "",
+    link_status: str = "",
+    link_note: str = "",
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    if saved.suffix.lower() == ".pdf":
+        pdf_bytes = saved.read_bytes()
+        parsed_pages = parse_invoice_pdf_pages(
+            pdf_bytes,
+            filename=saved.name,
+            vision_extract=vision_extract,
+        )
+        for parsed in parsed_pages:
+            fields = {
+                k: str(parsed.get(k, ""))
+                for k in (
+                    "invoice_date",
+                    "seller",
+                    "purchaser",
+                    "amount",
+                    "invoice_code",
+                    "invoice_number",
+                    "invoice_kind",
+                    "category",
+                )
+            }
+            page_number = int(parsed.get("page_number") or 1)
+            page_count = int(parsed.get("page_count") or len(parsed_pages) or 1)
+            parse_status = str(parsed.get("status", ""))
+            parse_engine = str(parsed.get("engine", ""))
+            with OUTPUT_LOCK:
+                if parse_status == "non_china_invoice":
+                    output_path = copy_to_manual_subfolder(saved, "非中国发票")
+                    status = "Non_CN_Invoice"
+                else:
+                    page_payload = split_pdf_page_to_bytes(pdf_bytes, page_number - 1) if page_count > 1 else None
+                    output_path, status = write_invoice_output(
+                        saved,
+                        fields,
+                        payload=page_payload,
+                        page_number=page_number if page_count > 1 else None,
+                    )
+                    if parse_engine == "vision_fallback" and parse_status == "parsed":
+                        status = "AI_Verified"
+            discovered_page_links = list(discovered_links)
+            discovered_page_links.extend(str(link) for link in parsed.get("links", []) if link)
+            note = str(parsed.get("error") or parsed.get("model_error") or link_note or "")
+            rows.append(
+                {
+                    "status": status,
+                    "parse_status": parse_status,
+                    "parse_engine": parse_engine,
+                    "page_number": str(page_number),
+                    "page_count": str(page_count),
+                    "mail_subject": subject,
+                    "mail_from": sender,
+                    "mail_date": sent_at,
+                    "mail_received_at": received_at,
+                    "source_uid": uid_text,
+                    "attachment_original_name": attachment_original_name,
+                    "original_file": str(saved),
+                    "output_file": str(output_path),
+                    "sha256": file_sha256(output_path),
+                    "invoice_date": fields.get("invoice_date", ""),
+                    "seller": fields.get("seller", ""),
+                    "purchaser": fields.get("purchaser", ""),
+                    "amount": fields.get("amount", ""),
+                    "invoice_code": fields.get("invoice_code", ""),
+                    "invoice_number": fields.get("invoice_number", ""),
+                    "invoice_kind": fields.get("invoice_kind", ""),
+                    "category": fields.get("category", ""),
+                    "links": " | ".join(dict.fromkeys(discovered_page_links[:20])),
+                    "note": note,
+                    "acquisition_method": acquisition_method,
+                    "link_platform": link_platform,
+                    "link_status": link_status,
+                }
+            )
+        return rows
+
+    rows.append(
+        {
+            "status": "Downloaded_Raw_Attachment" if acquisition_method == "邮件附件" else "Link_Downloaded_Raw",
+            "parse_status": "",
+            "parse_engine": "",
+            "page_number": "",
+            "page_count": "",
+            "mail_subject": subject,
+            "mail_from": sender,
+            "mail_date": sent_at,
+            "mail_received_at": received_at,
+            "source_uid": uid_text,
+            "attachment_original_name": attachment_original_name,
+            "original_file": str(saved),
+            "output_file": str(saved),
+            "sha256": file_sha256(saved),
+            "invoice_date": "",
+            "seller": "",
+            "purchaser": "",
+            "amount": "",
+            "invoice_code": "",
+            "invoice_number": "",
+            "invoice_kind": "",
+            "category": "",
+            "links": " | ".join(dict.fromkeys(discovered_links[:20])),
+            "note": link_note,
+            "acquisition_method": acquisition_method,
+            "link_platform": link_platform,
+            "link_status": link_status,
+        }
+    )
+    return rows
+
+
+def get_thread_mail(
+    env: dict[str, str],
+    mailbox: str,
+    context: ssl.SSLContext,
+    retry_attempts: int,
+    retry_sleep: float,
+    connections: list[imaplib.IMAP4_SSL],
+    connections_lock: threading.Lock,
+) -> imaplib.IMAP4_SSL:
+    mail = getattr(THREAD_LOCAL, "mail", None)
+    if mail is not None:
+        return mail
+
+    imap_host = env.get("QQ_IMAP_HOST", "imap.qq.com")
+    imap_port = int(env.get("QQ_IMAP_PORT", "993"))
+    imap_timeout = float(env.get("IMAP_TIMEOUT_SECONDS", "60"))
+    email_address = env.get("QQ_EMAIL", "")
+    auth_code = env.get("QQ_IMAP_AUTH_CODE", "")
+    mail = retry_call(
+        lambda: imaplib.IMAP4_SSL(imap_host, imap_port, ssl_context=context, timeout=imap_timeout),
+        attempts=retry_attempts,
+        sleep_seconds=retry_sleep,
+        label="IMAP worker connect",
+    )
+    retry_call(
+        lambda: mail.login(email_address, auth_code),
+        attempts=retry_attempts,
+        sleep_seconds=retry_sleep,
+        label="IMAP worker login",
+    )
+    retry_call(
+        lambda: mail.select(mailbox, readonly=True),
+        attempts=retry_attempts,
+        sleep_seconds=retry_sleep,
+        label="IMAP worker select",
+    )
+    THREAD_LOCAL.mail = mail
+    with connections_lock:
+        connections.append(mail)
+    return mail
+
+
+def close_worker_connections(connections: list[imaplib.IMAP4_SSL]) -> None:
+    for mail in connections:
+        try:
+            mail.close()
+        except Exception:
+            pass
+        try:
+            mail.logout()
+        except Exception:
+            pass
+
+
+def date_range_cache_path(since: str, until: str, limit: int | None = None) -> Path:
+    suffix = f"{since.replace('-', '')}_{until.replace('-', '')}"
+    if limit:
+        suffix = f"{suffix}_limit{limit}"
+    return STATE_DIR / f"rows_{suffix}.jsonl"
+
+
+def append_row_cache(cache_path: Path, mailbox: str, uid: bytes | str, status: str, rows: list[dict[str, str]], error: str = "") -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    uid_text = uid.decode("ascii", errors="replace") if isinstance(uid, bytes) else str(uid)
+    record = {
+        "mailbox": mailbox,
+        "uid": uid_text,
+        "status": status,
+        "records_count": len(rows),
+        "processed_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "error": error[:500],
+        "rows": rows,
+    }
+    with cache_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def load_row_cache(cache_path: Path) -> list[dict[str, str]]:
+    if not cache_path.exists():
+        return []
+    latest_by_uid: dict[tuple[str, str], dict[str, object]] = {}
+    with cache_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            key = (str(record.get("mailbox") or ""), str(record.get("uid") or ""))
+            latest_by_uid[key] = record
+    rows: list[dict[str, str]] = []
+    for record in latest_by_uid.values():
+        for row in record.get("rows") or []:
+            if isinstance(row, dict):
+                rows.append({str(k): "" if v is None else str(v) for k, v in row.items()})
+    return rows
+
+
+def process_message_uid(
+    env: dict[str, str],
+    mailbox: str,
+    message_uid: bytes,
+    run_stamp: str,
+    retry_attempts: int,
+    retry_sleep: float,
+    context: ssl.SSLContext,
+    vision_extract: Callable[[list[str], str], dict[str, str]] | None,
+    qr_url_extract: Callable[[list[str]], str] | None,
+    connections: list[imaplib.IMAP4_SSL],
+    connections_lock: threading.Lock,
+) -> tuple[bytes, str, list[dict[str, str]], str]:
+    message_rows: list[dict[str, str]] = []
+    uid_text = message_uid.decode("ascii", errors="replace")
+    try:
+        mail = get_thread_mail(env, mailbox, context, retry_attempts, retry_sleep, connections, connections_lock)
+        typ, fetched = retry_call(
+            lambda uid=message_uid: mail.uid("fetch", uid, "(RFC822 INTERNALDATE)"),
+            attempts=retry_attempts,
+            sleep_seconds=retry_sleep,
+            label=f"IMAP fetch UID {uid_text}",
+        )
+        if typ != "OK" or not fetched or not fetched[0]:
+            return message_uid, "fetch_failed", message_rows, "IMAP fetch failed"
+
+        msg = email.message_from_bytes(fetched[0][1])
+        subject = decode_mime_words(msg.get("Subject"))
+        sender = decode_mime_words(msg.get("From"))
+        sent_at = parse_date(msg.get("Date"))
+        received_at = parse_internal_date(fetched[0][0], sent_at)
+        subject_related = subject_has_invoice_keyword(subject)
+        if not subject_related:
+            return message_uid, "skipped_subject_filter", message_rows, ""
+
+        plain, html_text = get_text_parts(msg)
+        related = subject_related or looks_invoice_related(subject, sender, plain, html_text)
+        body_text = f"{plain}\n{re.sub(r'<[^>]+>', ' ', html_text or '')}"
+        link_candidates = select_invoice_link_candidates(
+            extract_link_candidates(plain, html_text) if related else [],
+            subject,
+            sender,
+            body_text,
+        )
+        urls = [candidate["url"] for candidate in link_candidates]
+        prefix = f"{run_stamp}_uid{uid_text}"
+        target_dir = RAW_DIR / run_stamp
+        saved_any = False
+
+        for part in msg.walk():
+            if part.get_content_maintype() == "multipart":
+                continue
+            disposition = str(part.get("Content-Disposition") or "").lower()
+            filename = part.get_filename()
+            if "attachment" not in disposition and not filename:
+                continue
+            saved_info = save_attachment(part, target_dir, prefix)
+            if not saved_info:
+                continue
+            saved, attachment_original_name = saved_info
+            saved_any = True
+            message_rows.extend(
+                rows_for_saved_artifact(
+                    saved,
+                    attachment_original_name,
+                    subject=subject,
+                    sender=sender,
+                    sent_at=sent_at,
+                    received_at=received_at,
+                    uid_text=uid_text,
+                    discovered_links=list(urls),
+                    vision_extract=vision_extract,
+                    acquisition_method="邮件附件",
+                )
+            )
+
+        link_artifacts: list[dict[str, str]] = []
+        unresolved_links: list[dict[str, str]] = []
+        if related and link_candidates:
+            link_prefix = f"{prefix}_link"
+            link_artifacts, unresolved_links = download_invoice_links(
+                link_candidates,
+                env,
+                target_dir,
+                link_prefix,
+                retry_attempts,
+                retry_sleep,
+            )
+            for artifact in link_artifacts:
+                artifact_path = Path(artifact["path"])
+                message_rows.extend(
+                    rows_for_saved_artifact(
+                        artifact_path,
+                        artifact.get("original_name") or artifact_path.name,
+                        subject=subject,
+                        sender=sender,
+                        sent_at=sent_at,
+                        received_at=received_at,
+                        uid_text=uid_text,
+                        discovered_links=[artifact.get("source_url", ""), artifact.get("resolved_url", "")],
+                        vision_extract=vision_extract,
+                        acquisition_method="正文链接",
+                        link_platform=artifact.get("platform", ""),
+                        link_status=artifact.get("status", "Link_Downloaded"),
+                    )
+                )
+
+        qr_artifacts: list[dict[str, str]] = []
+        unresolved_qr: list[dict[str, str]] = []
+        qr_candidates = collect_qr_image_candidates(msg, plain, html_text, env, retry_attempts, retry_sleep) if related else []
+        if qr_candidates:
+            qr_artifacts, unresolved_qr = recover_qr_invoice_links(
+                qr_candidates,
+                qr_url_extract,
+                env,
+                target_dir,
+                f"{prefix}_qr",
+                retry_attempts,
+                retry_sleep,
+                subject,
+                sender,
+            )
+            for artifact in qr_artifacts:
+                artifact_path = Path(artifact["path"])
+                message_rows.extend(
+                    rows_for_saved_artifact(
+                        artifact_path,
+                        artifact.get("original_name") or artifact_path.name,
+                        subject=subject,
+                        sender=sender,
+                        sent_at=sent_at,
+                        received_at=received_at,
+                        uid_text=uid_text,
+                        discovered_links=[artifact.get("source_url", ""), artifact.get("resolved_url", "")],
+                        vision_extract=vision_extract,
+                        acquisition_method="二维码识别",
+                        link_platform=artifact.get("platform", ""),
+                        link_status=artifact.get("status", "Link_Downloaded"),
+                    )
+                )
+            if unresolved_qr and not qr_artifacts:
+                for unresolved in unresolved_qr[:5]:
+                    message_rows.append(
+                        blank_manifest_row(
+                            status="QR_Need_Manual",
+                            subject=subject,
+                            sender=sender,
+                            sent_at=sent_at,
+                            received_at=received_at,
+                            uid_text=uid_text,
+                            links=unresolved.get("url", ""),
+                            note=unresolved.get("note", "二维码需要人工确认。"),
+                            acquisition_method="二维码识别",
+                            link_platform=unresolved.get("platform", ""),
+                            link_status="QR_Need_Manual",
+                        )
+                    )
+
+        if related and link_candidates and not link_artifacts and not qr_artifacts:
+            if unresolved_links:
+                for unresolved in unresolved_links[:5]:
+                    message_rows.append(
+                        blank_manifest_row(
+                            status=unresolved.get("status", "Link_Need_Manual"),
+                            subject=subject,
+                            sender=sender,
+                            sent_at=sent_at,
+                            received_at=received_at,
+                            uid_text=uid_text,
+                            links=unresolved.get("url", ""),
+                            note=unresolved.get("note", "链接需要人工确认。"),
+                            acquisition_method="正文链接",
+                            link_platform=unresolved.get("platform", ""),
+                            link_status=unresolved.get("status", "Link_Need_Manual"),
+                        )
+                    )
+            elif not saved_any and not unresolved_qr:
+                message_rows.append(
+                    blank_manifest_row(
+                        status="Link_Need_Manual",
+                        subject=subject,
+                        sender=sender,
+                        sent_at=sent_at,
+                        received_at=received_at,
+                        uid_text=uid_text,
+                        links=urls[:20],
+                        note="邮件疑似发票，但链接未能自动解析出 PDF/OFD/XML，需要人工确认。",
+                        acquisition_method="正文链接",
+                        link_platform=", ".join(sorted({candidate.get("platform", "") for candidate in link_candidates if candidate.get("platform")})),
+                        link_status="Link_Need_Manual",
+                    )
+                )
+        return message_uid, "processed", message_rows, ""
+    except Exception as exc:
+        return message_uid, "failed", message_rows, str(exc)
+
+
+def scan_mailbox(
+    env: dict[str, str],
+    since: str,
+    until: str,
+    limit: int | None,
+    log_db: Path = DEFAULT_LOG_DB,
+    reprocess: bool = False,
+    row_cache: Path | None = None,
+) -> list[dict[str, str]]:
+    email_address = env.get("QQ_EMAIL", "")
+    auth_code = env.get("QQ_IMAP_AUTH_CODE", "")
+    if not email_address or not auth_code:
+        raise SystemExit("Missing QQ_EMAIL or QQ_IMAP_AUTH_CODE in env file.")
+
+    imap_host = env.get("QQ_IMAP_HOST", "imap.qq.com")
+    imap_port = int(env.get("QQ_IMAP_PORT", "993"))
+    imap_timeout = float(env.get("IMAP_TIMEOUT_SECONDS", "60"))
+    mailbox = env.get("QQ_MAILBOX", "INBOX")
+    retry_attempts = int(env.get("RETRY_ATTEMPTS", "3"))
+    retry_sleep = float(env.get("RETRY_SLEEP_SECONDS", "2"))
+    context = ssl.create_default_context()
+    mail = retry_call(
+        lambda: imaplib.IMAP4_SSL(imap_host, imap_port, ssl_context=context, timeout=imap_timeout),
+        attempts=retry_attempts,
+        sleep_seconds=retry_sleep,
+        label="IMAP connect",
+    )
+    retry_call(
+        lambda: mail.login(email_address, auth_code),
+        attempts=retry_attempts,
+        sleep_seconds=retry_sleep,
+        label="IMAP login",
+    )
+    log = ProcessLog(log_db)
+    row_cache = row_cache or date_range_cache_path(since, until, limit)
+    if reprocess and row_cache.exists():
+        row_cache.unlink()
+    try:
+        retry_call(
+            lambda: mail.select(mailbox, readonly=True),
+            attempts=retry_attempts,
+            sleep_seconds=retry_sleep,
+            label="IMAP select",
+        )
+        message_ids = search_invoice_candidate_uids(
+            mail,
+            since=since,
+            until=until,
+            retry_attempts=retry_attempts,
+            retry_sleep=retry_sleep,
+            limit=limit,
+        )
+
+        rows: list[dict[str, str]] = []
+        run_stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        vision_extract = build_mimo_vision_extractor(env)
+        qr_url_extract = build_mimo_qr_url_extractor(env)
+        pending_ids = [message_uid for message_uid in message_ids if reprocess or not log.is_processed(mailbox, message_uid)]
+        skipped_count = len(message_ids) - len(pending_ids)
+        print(f"Sample Calibration concurrency: max_workers={MAX_WORKERS}, pending={len(pending_ids)}, skipped={skipped_count}")
+
+        worker_connections: list[imaplib.IMAP4_SSL] = []
+        worker_connections_lock = threading.Lock()
+        try:
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = {
+                    executor.submit(
+                        process_message_uid,
+                        env,
+                        mailbox,
+                        message_uid,
+                        run_stamp,
+                        retry_attempts,
+                        retry_sleep,
+                        context,
+                        vision_extract,
+                        qr_url_extract,
+                        worker_connections,
+                        worker_connections_lock,
+                    ): message_uid
+                    for message_uid in pending_ids
+                }
+                with make_progress(len(futures), "Sample Calibration") as progress:
+                    for future in as_completed(futures):
+                        message_uid = futures[future]
+                        try:
+                            uid, status, message_rows, error = future.result()
+                        except Exception as exc:
+                            uid = message_uid
+                            status = "failed"
+                            message_rows = []
+                            error = str(exc)
+                        rows.extend(message_rows)
+                        log.mark(mailbox, uid, status, len(message_rows), error)
+                        append_row_cache(row_cache, mailbox, uid, status, message_rows, error)
+                        progress.update(1)
+                        progress.set_postfix(records=len(rows), last=status)
+        finally:
+            close_worker_connections(worker_connections)
+        cached_rows = load_row_cache(row_cache)
+        return cached_rows if cached_rows else rows
+    finally:
+        log.close()
+        try:
+            mail.close()
+        except Exception:
+            pass
+        mail.logout()
+
+
+def write_report(rows: list[dict[str, str]]) -> Path:
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    report_path = REPORT_DIR / f"invoice_manifest_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    fieldnames = [
+        "status",
+        "parse_status",
+        "parse_engine",
+        "page_number",
+        "page_count",
+        "mail_subject",
+        "mail_from",
+        "mail_date",
+        "mail_received_at",
+        "source_uid",
+        "attachment_original_name",
+        "original_file",
+        "output_file",
+        "sha256",
+        "invoice_date",
+        "seller",
+        "purchaser",
+        "amount",
+        "invoice_code",
+        "invoice_number",
+        "invoice_kind",
+        "category",
+        "acquisition_method",
+        "link_platform",
+        "link_status",
+        "links",
+        "note",
+    ]
+    with report_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return report_path
+
+
+def write_xlsx_report(rows: list[dict[str, str]], csv_path: Path) -> Path:
+    xlsx_path = csv_path.with_suffix(".xlsx")
+    import pandas as pd
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    internal_columns = [
+        "status",
+        "parse_status",
+        "parse_engine",
+        "invoice_date",
+        "seller",
+        "purchaser",
+        "amount",
+        "invoice_code",
+        "invoice_number",
+        "invoice_kind",
+        "category",
+        "page_number",
+        "page_count",
+        "mail_received_at",
+        "mail_date",
+        "attachment_original_name",
+        "output_file",
+        "original_file",
+        "mail_from",
+        "mail_subject",
+        "acquisition_method",
+        "link_platform",
+        "link_status",
+        "links",
+        "note",
+        "sha256",
+        "source_uid",
+    ]
+    df = pd.DataFrame(rows)
+    for col in internal_columns:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[internal_columns]
+    df["amount_numeric"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
+
+    def output_basename(value: object, fallback: object) -> str:
+        text = str(value or "")
+        if text:
+            return Path(text).name
+        return str(fallback or "")
+
+    df["ledger_file_name"] = [output_basename(row.output_file, row.attachment_original_name) for row in df.itertuples()]
+    ledger_columns = [
+        ("category", "发票类型"),
+        ("invoice_date", "开票日期"),
+        ("purchaser", "付款方"),
+        ("seller", "收款方"),
+        ("amount", "金额"),
+        ("ledger_file_name", "发票名"),
+        ("invoice_kind", "增值税类型"),
+        ("status", "状态"),
+        ("acquisition_method", "获取方式"),
+        ("link_platform", "链接平台"),
+        ("link_status", "链接处理状态"),
+        ("mail_received_at", "邮件接收时间"),
+        ("attachment_original_name", "附件原名"),
+        ("invoice_number", "发票号码"),
+        ("invoice_code", "发票代码"),
+        ("page_number", "页码"),
+        ("output_file", "整理后文件"),
+        ("original_file", "原始文件"),
+        ("mail_from", "发件人"),
+        ("mail_subject", "邮件主题"),
+        ("links", "链接线索"),
+        ("note", "备注"),
+        ("source_uid", "邮件UID"),
+    ]
+    ledger_df = pd.DataFrame({header: df[source] for source, header in ledger_columns})
+
+    valid_df = df[df["status"].isin(["Parsed", "AI_Verified"])]
+    category_summary = (
+        valid_df.groupby("category", dropna=False)
+        .agg(records=("status", "count"), total_amount=("amount_numeric", "sum"), ai_verified=("status", lambda s: int((s == "AI_Verified").sum())))
+        .reset_index()
+        .rename(columns={"category": "发票类型", "records": "张数", "total_amount": "金额合计", "ai_verified": "AI复核张数"})
+        .sort_values("金额合计", ascending=False)
+        if not valid_df.empty
+        else pd.DataFrame(columns=["发票类型", "张数", "金额合计", "AI复核张数"])
+    )
+    kind_summary = (
+        valid_df.groupby("invoice_kind", dropna=False)
+        .agg(records=("status", "count"), total_amount=("amount_numeric", "sum"))
+        .reset_index()
+        .rename(columns={"invoice_kind": "增值税类型", "records": "张数", "total_amount": "金额合计"})
+        .sort_values("金额合计", ascending=False)
+        if not valid_df.empty
+        else pd.DataFrame(columns=["增值税类型", "张数", "金额合计"])
+    )
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        ledger_df.to_excel(writer, sheet_name="发票台账", index=False)
+        category_summary.to_excel(writer, sheet_name="分类汇总", index=False)
+        kind_summary.to_excel(writer, sheet_name="增值税类型汇总", index=False)
+        workbook = writer.book
+        for sheet_name in ("发票台账", "分类汇总", "增值税类型汇总"):
+            ws = workbook[sheet_name]
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            for cell in ws[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="1F4E78")
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            for column_cells in ws.columns:
+                max_len = max(len(str(cell.value or "")) for cell in column_cells[:200])
+                ws.column_dimensions[get_column_letter(column_cells[0].column)].width = min(max(max_len + 2, 10), 48)
+        ledger = workbook["发票台账"]
+        ledger.freeze_panes = "A2"
+        amount_col = list(ledger_df.columns).index("金额") + 1
+        status_col = list(ledger_df.columns).index("状态") + 1
+        yellow_fill = PatternFill("solid", fgColor="FFF2CC")
+        red_fill = PatternFill("solid", fgColor="F4CCCC")
+        gray_fill = PatternFill("solid", fgColor="D9EAD3")
+        for row in range(2, ledger.max_row + 1):
+            amount_cell = ledger.cell(row=row, column=amount_col)
+            try:
+                amount_cell.value = float(str(amount_cell.value or "").replace(",", ""))
+            except ValueError:
+                pass
+            amount_cell.number_format = '#,##0.00'
+            value = ledger.cell(row=row, column=status_col).value
+            if value == "AI_Verified":
+                for col in range(1, ledger.max_column + 1):
+                    ledger.cell(row=row, column=col).fill = yellow_fill
+            elif value in {"Need_Review", "Link_Need_Manual", "QR_Need_Manual"}:
+                ledger.cell(row=row, column=status_col).fill = red_fill
+            elif value == "Non_CN_Invoice":
+                ledger.cell(row=row, column=status_col).fill = gray_fill
+        summary_sheet = workbook["分类汇总"]
+        if summary_sheet.max_row >= 2:
+            total_amount_col = 3
+            for row in range(2, summary_sheet.max_row + 1):
+                summary_sheet.cell(row=row, column=total_amount_col).number_format = '#,##0.00'
+        kind_sheet = workbook["增值税类型汇总"]
+        if kind_sheet.max_row >= 2:
+            for row in range(2, kind_sheet.max_row + 1):
+                kind_sheet.cell(row=row, column=3).number_format = '#,##0.00'
+    return xlsx_path
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Collect 2026 invoices from QQ mailbox through read-only IMAP.")
+    parser.add_argument("--env", type=Path, default=CONFIG_DIR / "invoice_mail.env")
+    parser.add_argument("--since", default=None, help="Override START_DATE from env file.")
+    parser.add_argument("--until", default=None, help="Override END_DATE from env file; defaults to today.")
+    parser.add_argument("--limit", type=int, default=None, help="Only process latest N matched messages for a safe trial run.")
+    parser.add_argument("--log-db", type=Path, default=DEFAULT_LOG_DB)
+    parser.add_argument("--row-cache", type=Path, default=None, help="JSONL row cache for resumable ledger output.")
+    parser.add_argument("--reprocess", action="store_true", help="Ignore UID checkpoint and process messages again.")
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    for directory in (CONFIG_DIR, RAW_DIR, PROCESSED_DIR, MANUAL_DIR, REPORT_DIR, STATE_DIR):
+        directory.mkdir(parents=True, exist_ok=True)
+    env = load_env(args.env)
+    started = time.time()
+    if str(env.get("MIMO_CALIBRATION_MODE") or "").strip().lower() in {"1", "true", "yes", "on"}:
+        print("Sample Calibration mode enabled.")
+    since = args.since or env.get("START_DATE") or "2026-01-01"
+    until = args.until or env.get("END_DATE") or dt.date.today().isoformat()
+    row_cache = args.row_cache or date_range_cache_path(since, until, args.limit)
+    rows = scan_mailbox(env, since, until, args.limit, log_db=args.log_db, reprocess=args.reprocess, row_cache=row_cache)
+    report_path = write_report(rows)
+    xlsx_path = write_xlsx_report(rows, report_path)
+    print(
+        json.dumps(
+            {
+                "status": "completed",
+                "records": len(rows),
+                "csv_report": str(report_path),
+                "xlsx_report": str(xlsx_path),
+                "row_cache": str(row_cache),
+                "elapsed_seconds": round(time.time() - started, 1),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
