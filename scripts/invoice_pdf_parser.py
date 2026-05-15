@@ -478,6 +478,15 @@ def extract_china_invoice_parties(lines: list[str]) -> dict[str, str]:
             if valid_name(lines[idx]):
                 parties["seller"] = _clean_name(lines[idx])
                 break
+    if tax_indices and not parties.get("seller"):
+        names_before_tax = [
+            _clean_name(lines[idx])
+            for idx in range(max(0, tax_indices[0] - 8), tax_indices[0])
+            if valid_name(lines[idx])
+        ]
+        if len(names_before_tax) >= 2:
+            parties.setdefault("seller", names_before_tax[-2])
+            parties.setdefault("purchaser", names_before_tax[-1])
 
     if parties.get("purchaser") and parties.get("seller"):
         return parties

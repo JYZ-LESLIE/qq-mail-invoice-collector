@@ -22,6 +22,7 @@ from email.message import Message
 import hashlib
 import html
 from html.parser import HTMLParser
+import io
 import imaplib
 import json
 import math
@@ -34,6 +35,7 @@ import ssl
 import threading
 import time
 from typing import Callable, Iterable, TypeVar
+import zipfile
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, unquote, urljoin, urlparse
@@ -46,7 +48,7 @@ from invoice_pdf_parser import (
 )
 
 
-WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 INVOICE_ROOT = WORKSPACE_ROOT / "发票整理"
 CONFIG_DIR = INVOICE_ROOT / "私密配置"
 RAW_DIR = INVOICE_ROOT / "原始附件"
@@ -97,6 +99,7 @@ DOWNLOAD_ATTACHMENT_EXTENSIONS = {".pdf", ".ofd"}
 SKIPPED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
 MIN_IMAGE_SIGNATURE_BYTES = 20 * 1024
 INVOICE_EXTENSIONS = {".pdf", ".ofd", ".xml"}
+ARCHIVE_EXTENSIONS = {".zip"}
 URL_RE = re.compile(r"https?://[^\s\"'<>）)]+", re.IGNORECASE)
 LINK_DOWNLOAD_TIMEOUT_SECONDS = 30
 MAX_LINK_DOWNLOAD_BYTES = 25 * 1024 * 1024
@@ -135,6 +138,23 @@ BANK_SENDER_HINTS = (
     "za.group",
     "za.bank",
     "bochk.com",
+)
+NON_REIMBURSABLE_MARKERS = (
+    "netlify, inc",
+    "invoices.withorb.com",
+    "出行确认单（附件：中英文行程单）",
+    "中英文行程单",
+    "ctrip_booking_confirmed",
+)
+DEFERRED_PLATFORM_MARKERS = (
+    "icloud+",
+    "icloud-efapiao.gzdata.com.cn",
+)
+CTRIP_UTILITY_PATH_MARKERS = (
+    "icp.pdf",
+    "internetdrugcertificate.pdf",
+    "yiliao.pdf",
+    "wxsb/",
 )
 LINK_INVOICE_HINTS = (
     "发票",
@@ -474,6 +494,45 @@ def is_bank_statement_row(row: dict[str, str]) -> bool:
     )
 
 
+def is_non_reimbursable_email(subject: str, sender: str, body_text: str = "") -> bool:
+    combined = f"{subject} {sender} {body_text[:2500]}".lower()
+    if any(marker.lower() in combined for marker in NON_REIMBURSABLE_MARKERS):
+        return True
+    if any(marker in combined for marker in CTRIP_UTILITY_PATH_MARKERS):
+        return True
+    return False
+
+
+def is_deferred_platform_email(subject: str, sender: str, body_text: str = "") -> bool:
+    combined = f"{subject} {sender} {body_text[:2500]}".lower()
+    return any(marker.lower() in combined for marker in DEFERRED_PLATFORM_MARKERS)
+
+
+def is_excluded_business_row(row: dict[str, str]) -> bool:
+    combined = " ".join(
+        str(row.get(key) or "")
+        for key in (
+            "mail_subject",
+            "mail_from",
+            "seller",
+            "purchaser",
+            "attachment_original_name",
+            "original_file",
+            "output_file",
+            "links",
+            "note",
+            "link_platform",
+        )
+    ).lower()
+    if any(marker.lower() in combined for marker in NON_REIMBURSABLE_MARKERS):
+        return True
+    if any(marker.lower() in combined for marker in DEFERRED_PLATFORM_MARKERS):
+        return True
+    if any(marker in combined for marker in CTRIP_UTILITY_PATH_MARKERS):
+        return True
+    return False
+
+
 def output_is_pdf(row: dict[str, str]) -> bool:
     output_file = str(row.get("output_file") or row.get("original_file") or row.get("attachment_original_name") or "")
     return Path(output_file).suffix.lower() == ".pdf"
@@ -528,12 +587,55 @@ def clean_manifest_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         status = str(row.get("status") or "")
         if is_bank_statement_row(row):
             continue
+        if is_excluded_business_row(row):
+            continue
         if status == "Non_CN_Invoice":
             continue
         if status in {"Downloaded_Raw_Attachment", "Link_Downloaded_Raw"} and not output_is_pdf(row):
             continue
         filtered.append(row)
-    return dedupe_invoice_rows(filtered)
+    filtered = dedupe_invoice_rows(filtered)
+    parsed_numbers = {
+        str(row.get("invoice_number") or "").strip()
+        for row in filtered
+        if row.get("status") in {"Parsed", "AI_Verified"} and str(row.get("invoice_number") or "").strip()
+    }
+    parsed_date_amount = {
+        (str(row.get("invoice_date") or "").strip(), str(row.get("amount") or "").strip())
+        for row in filtered
+        if row.get("status") in {"Parsed", "AI_Verified"}
+        and str(row.get("invoice_date") or "").strip()
+        and str(row.get("amount") or "").strip()
+    }
+    parsed_uids = {
+        str(row.get("source_uid") or "").strip()
+        for row in filtered
+        if row.get("status") in {"Parsed", "AI_Verified"} and str(row.get("source_uid") or "").strip()
+    }
+    final_rows: list[dict[str, str]] = []
+    for row in filtered:
+        if row.get("status") not in {"Parsed", "AI_Verified"}:
+            invoice_number = str(row.get("invoice_number") or "").strip()
+            invoice_date = str(row.get("invoice_date") or "").strip()
+            amount = str(row.get("amount") or "").strip()
+            uid = str(row.get("source_uid") or "").strip()
+            subject = str(row.get("mail_subject") or "")
+            links = str(row.get("links") or "").lower()
+            if invoice_number and invoice_number in parsed_numbers:
+                continue
+            if invoice_date and amount and (invoice_date, amount) in parsed_date_amount:
+                continue
+            if uid and uid in parsed_uids and row.get("status") in {"Link_Need_Manual", "QR_Need_Manual"}:
+                continue
+            if row.get("status") == "Link_Need_Manual" and not row.get("output_file"):
+                if "store.apple.com/us/go/app" in links:
+                    continue
+                if "Apple 订单" in subject and "fdfinvoice.com" in links:
+                    continue
+                if "淘宝闪购平台订单发票开具完成通知" in subject and ".zip" in links:
+                    continue
+        final_rows.append(row)
+    return final_rows
 
 
 def extract_urls(*texts: str) -> list[str]:
@@ -595,17 +697,25 @@ def extract_link_candidates(plain: str, html_text: str) -> list[dict[str, str]]:
 
 
 def detect_link_platform(url: str, sender: str = "", subject: str = "") -> str:
-    del sender, subject
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
+    combined = f"{url} {sender} {subject}".lower()
     if any(token in host for token in ("nfp.jss.com.cn", "jss.com.cn", "nuonuo.com")):
         return "诺诺网/JSS"
     if any(token in host for token in ("baiwang", "efapiao.com", "bwjf.cn")):
         return "百望/票通"
     if "chinatax.gov.cn" in host:
         return "税务平台直链"
+    if "fdfinvoice.com" in host:
+        return "Apple硬件发票"
     if "apple.com" in host:
         return "Apple"
+    if "jdcloud-oss.com" in host or "jd.com" in host:
+        return "京东"
+    if "bytedance.com" in host or "feishu" in combined or "larksuite" in combined:
+        return "飞书"
+    if "fin-invoice" in host or "taobao" in combined or "淘宝" in combined:
+        return "淘宝闪购"
     if any(token in host for token in ("didi.com", "didichuxing.com")):
         return "滴滴"
     if "meituan.com" in host:
@@ -625,10 +735,10 @@ def link_has_invoice_signal(candidate: dict[str, str], subject: str, sender: str
     parsed = urlparse(url)
     ext = Path(parsed.path).suffix.lower()
     platform = detect_link_platform(url, sender, subject)
-    if ext in INVOICE_EXTENSIONS:
+    if ext in INVOICE_EXTENSIONS or ext in ARCHIVE_EXTENSIONS:
         return True
     has_link_hint = any(hint.lower() in link_text for hint in LINK_INVOICE_HINTS)
-    if platform in {"诺诺网/JSS", "百望/票通", "税务平台直链"}:
+    if platform in {"诺诺网/JSS", "百望/票通", "税务平台直链", "Apple硬件发票", "京东", "飞书", "淘宝闪购"}:
         return True
     if platform != "未知平台" and has_link_hint:
         return True
@@ -684,7 +794,9 @@ def link_candidate_priority(candidate: dict[str, str]) -> tuple[int, str]:
     url = candidate.get("url", "").lower()
     anchor = candidate.get("anchor_text", "").lower()
     ext = Path(urlparse(url).path).suffix.lower()
-    if ext in {".pdf", ".ofd", ".xml"}:
+    if ext in {".pdf", ".ofd", ".xml", ".zip"}:
+        return (0, url)
+    if "fdfinvoice.com" in url:
         return (0, url)
     if any(token in url for token in ("downloadpdf", "downloadofd", "downloadxml", "wjgs=pdf", "jflx=pdf")):
         return (1, url)
@@ -702,6 +814,8 @@ def make_link_headers(env: dict[str, str]) -> dict[str, str]:
 
 def infer_download_extension(url: str, content_type: str, content_disposition: str, data: bytes) -> str:
     combined = f"{url} {content_type} {content_disposition}".lower()
+    if data.startswith(b"PK\x03\x04") or "application/zip" in combined or ".zip" in combined:
+        return ".zip"
     if data.startswith(b"%PDF") or "application/pdf" in combined or ".pdf" in combined or "wjgs=pdf" in combined or "jflx=pdf" in combined:
         return ".pdf"
     if "ofd" in combined or ".ofd" in combined or "wjgs=ofd" in combined or "jflx=ofd" in combined:
@@ -867,6 +981,112 @@ def save_response_artifact(
     return saved, filename
 
 
+def extract_zip_invoice_artifacts(
+    data: bytes,
+    target_dir: Path,
+    prefix: str,
+    source_url: str,
+    resolved_url: str,
+    platform: str,
+) -> list[dict[str, str]]:
+    artifacts: list[dict[str, str]] = []
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        return artifacts
+
+    with archive:
+        for index, info in enumerate(archive.infolist(), start=1):
+            if info.is_dir():
+                continue
+            ext = Path(info.filename).suffix.lower()
+            if ext not in INVOICE_EXTENSIONS:
+                continue
+            payload = archive.read(info)
+            if ext == ".pdf" and not payload.startswith(b"%PDF"):
+                continue
+            if ext == ".xml" and not payload.lstrip().startswith(b"<?xml"):
+                continue
+            filename = safe_name(Path(info.filename).name, f"invoice_zip_{index}{ext}")
+            saved = save_downloaded_artifact(payload, target_dir, filename, f"{prefix}_zip{index}", ext)
+            artifacts.append(
+                {
+                    "path": str(saved),
+                    "original_name": filename,
+                    "source_url": source_url,
+                    "resolved_url": resolved_url,
+                    "platform": platform,
+                    "status": "Link_Downloaded",
+                }
+            )
+    return artifacts
+
+
+def fetch_apple_fdfinvoice_artifacts(
+    url: str,
+    env: dict[str, str],
+    target_dir: Path,
+    prefix: str,
+    retry_attempts: int,
+    retry_sleep: float,
+) -> list[dict[str, str]]:
+    parsed = urlparse(url)
+    order_ref_no = dict(parse_qsl(parsed.query, keep_blank_values=True)).get("orderRefNo", "")
+    if not order_ref_no:
+        return []
+
+    endpoint = "https://www.fdfinvoice.com/prod-api/output/unauth/getDeliverDataByOrderRefNo"
+    headers = make_link_headers(env)
+    headers.update(
+        {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json;charset=UTF-8",
+            "Origin": "https://www.fdfinvoice.com",
+            "Referer": url,
+        }
+    )
+
+    def once() -> list[dict[str, str]]:
+        req = urlrequest.Request(endpoint, data=order_ref_no.encode("utf-8"), headers=headers, method="POST")
+        with urlrequest.urlopen(req, timeout=LINK_DOWNLOAD_TIMEOUT_SECONDS) as response:
+            body = response.read(MAX_LINK_DOWNLOAD_BYTES)
+        payload = json.loads(body.decode("utf-8", errors="replace"))
+        if str(payload.get("code")) != "200":
+            raise RuntimeError(str(payload.get("msg") or "apple_fdfinvoice_failed"))
+        result: list[dict[str, str]] = []
+        for item in payload.get("data") or []:
+            try:
+                amount = float(str(item.get("totalTaxAmount") or "0").replace(",", ""))
+            except ValueError:
+                amount = 0.0
+            buyer = str(item.get("buyerName") or "")
+            if item.get("expireFlag") or str(item.get("isRed") or "") == "1" or amount <= 0:
+                continue
+            if buyer in {"个人", "个人用户"}:
+                continue
+            pdf_url = str(item.get("pdfUrl") or "")
+            if not pdf_url:
+                continue
+            pdf_data, content_type, disposition, resolved_url = fetch_url_bytes(pdf_url, env, retry_attempts, retry_sleep)
+            ext = infer_download_extension(resolved_url, content_type, disposition, pdf_data) or ".pdf"
+            if ext != ".pdf":
+                continue
+            saved, filename = save_response_artifact(resolved_url, disposition, pdf_data, target_dir, prefix, ext)
+            result.append(
+                {
+                    "path": str(saved),
+                    "original_name": filename,
+                    "source_url": url,
+                    "resolved_url": resolved_url,
+                    "platform": "Apple硬件发票",
+                    "status": "Link_Downloaded",
+                }
+            )
+        return result
+
+    return retry_call(once, attempts=retry_attempts, sleep_seconds=retry_sleep, label="Apple hardware invoice download")
+
+
 def download_invoice_links(
     candidates: list[dict[str, str]],
     env: dict[str, str],
@@ -888,6 +1108,19 @@ def download_invoice_links(
         seen.add(url)
         platform = candidate.get("platform") or detect_link_platform(url)
         try:
+            if platform == "Apple硬件发票":
+                apple_artifacts = fetch_apple_fdfinvoice_artifacts(
+                    url,
+                    env,
+                    target_dir,
+                    prefix,
+                    retry_attempts,
+                    retry_sleep,
+                )
+                if apple_artifacts:
+                    artifacts.extend(apple_artifacts)
+                    continue
+
             if is_nuonuo_short_invoice_link(url):
                 nuonuo_result = fetch_nuonuo_pdf_artifact(url, env, retry_attempts, retry_sleep)
                 if nuonuo_result:
@@ -909,6 +1142,11 @@ def download_invoice_links(
             data, content_type, disposition, resolved_url = fetch_url_bytes(url, env, retry_attempts, retry_sleep)
             ext = infer_download_extension(resolved_url, content_type, disposition, data)
             if ext:
+                if ext == ".zip":
+                    zip_artifacts = extract_zip_invoice_artifacts(data, target_dir, prefix, url, resolved_url, platform)
+                    if zip_artifacts:
+                        artifacts.extend(zip_artifacts)
+                        continue
                 saved, filename = save_response_artifact(resolved_url, disposition, data, target_dir, prefix, ext)
                 artifacts.append(
                     {
@@ -1770,6 +2008,10 @@ def process_message_uid(
         body_text = f"{plain}\n{re.sub(r'<[^>]+>', ' ', html_text or '')}"
         if is_bank_statement_email(subject, sender, body_text):
             return message_uid, "skipped_bank_statement", message_rows, ""
+        if is_non_reimbursable_email(subject, sender, body_text):
+            return message_uid, "skipped_non_reimbursable", message_rows, ""
+        if is_deferred_platform_email(subject, sender, body_text):
+            return message_uid, "skipped_deferred_platform", message_rows, ""
 
         related = subject_related or looks_invoice_related(subject, sender, plain, html_text)
         link_candidates = select_invoice_link_candidates(
