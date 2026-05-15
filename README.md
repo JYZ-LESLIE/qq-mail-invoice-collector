@@ -9,6 +9,8 @@
 - 支持 PDF 附件、邮件正文链接、二维码链接接力下载。
 - 支持诺诺网/JSS 短链接接口解析，能从前端落地页继续找到真实 PDF 下载地址。
 - 支持云票/百望 `fp.bwjf.cn` 短链和 `allEleDeliverySuccess` 页面二跳，强制优先下载 PDF，并过滤 `bdopcs.bwjf.cn` 浏览埋点链接。
+- 支持智云/税局直链的 XML/OFD 兜底：PDF 不可读或不可达时，能从 XML 结构化字段入账。
+- 支持淘宝闪购蓝色链接和 ZIP 包拆解；链接下载到图片等非发票文件时标记为 `Non_Invoice_Link`。
 - 支持 Apple 硬件发票页、飞书 zip 下载、淘宝闪购 zip 下载、京东直链 PDF 的专门解析。
 - 支持单个 PDF 多页多张发票。
 - 只纳入中国发票；海外 Invoice/Receipt 会标记为 `Non_CN_Invoice`。

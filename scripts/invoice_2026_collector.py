@@ -35,6 +35,7 @@ import ssl
 import threading
 import time
 from typing import Callable, Iterable, TypeVar
+import xml.etree.ElementTree as ET
 import zipfile
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
@@ -43,7 +44,9 @@ from urllib.parse import parse_qsl, unquote, urljoin, urlparse
 from invoice_pdf_parser import (
     build_mimo_qr_url_extractor,
     build_mimo_vision_extractor,
+    has_minimum_invoice_fields,
     parse_invoice_pdf_pages,
+    parse_invoice_fields_from_text,
     split_pdf_page_to_bytes,
 )
 
@@ -644,7 +647,18 @@ def clean_manifest_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
                 continue
             if not invoice_number and invoice_date and amount and (invoice_date, amount) in parsed_date_amount:
                 continue
+            artifact_number_match = re.search(
+                r"\b(\d{20})\b",
+                " ".join(
+                    str(row.get(key) or "")
+                    for key in ("attachment_original_name", "original_file", "output_file", "links")
+                ),
+            )
+            if row.get("status") == "Need_Review" and artifact_number_match and artifact_number_match.group(1) in parsed_numbers:
+                continue
             if uid and uid in parsed_uids and row.get("status") in {"Link_Need_Manual", "QR_Need_Manual"}:
+                continue
+            if uid and uid in parsed_uids and row.get("status") == "Need_Review" and not invoice_number:
                 continue
             if row.get("status") == "Link_Need_Manual" and not row.get("output_file"):
                 if "store.apple.com/us/go/app" in links:
@@ -925,19 +939,35 @@ def read_limited_response(response: object, limit: int = MAX_LINK_DOWNLOAD_BYTES
 
 def fetch_url_bytes(url: str, env: dict[str, str], retry_attempts: int, retry_sleep: float) -> tuple[bytes, str, str, str]:
     headers = make_link_headers(env)
+    if "chinatax.gov.cn" in (urlparse(url).hostname or "").lower():
+        headers["User-Agent"] = env.get("LINK_USER_AGENT") or "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+    def urllib_once() -> tuple[bytes, str, str, str]:
+        req = urlrequest.Request(url, headers=headers)
+        with urlrequest.urlopen(req, timeout=LINK_DOWNLOAD_TIMEOUT_SECONDS) as response:
+            data = read_limited_response(response)
+            content_type = str(response.headers.get("Content-Type") or "")
+            disposition = str(response.headers.get("Content-Disposition") or "")
+            resolved_url = str(response.geturl() or url)
+        return data, content_type, disposition, resolved_url
 
     def once() -> tuple[bytes, str, str, str]:
         import httpx
 
-        with httpx.Client(
-            follow_redirects=True,
-            headers=headers,
-            timeout=LINK_DOWNLOAD_TIMEOUT_SECONDS,
-            trust_env=False,
-        ) as client:
-            response = client.get(url)
-            response.raise_for_status()
-            data = response.content
+        try:
+            with httpx.Client(
+                follow_redirects=True,
+                headers=headers,
+                timeout=LINK_DOWNLOAD_TIMEOUT_SECONDS,
+                trust_env=False,
+            ) as client:
+                response = client.get(url)
+                response.raise_for_status()
+                data = response.content
+        except Exception:
+            if "chinatax.gov.cn" in (urlparse(url).hostname or "").lower():
+                return urllib_once()
+            raise
         if len(data) > MAX_LINK_DOWNLOAD_BYTES:
             raise RuntimeError("download_too_large")
         content_type = str(response.headers.get("Content-Type") or "")
@@ -1178,8 +1208,13 @@ def extract_zip_invoice_artifacts(
             payload = archive.read(info)
             if ext == ".pdf" and not payload.startswith(b"%PDF"):
                 continue
-            if ext == ".xml" and not payload.lstrip().startswith(b"<?xml"):
-                continue
+            if ext == ".xml":
+                stripped = payload.lstrip()
+                if not stripped.startswith(b"<?xml"):
+                    continue
+                head = stripped[:4096].lower()
+                if b"<einvoice" not in head and b"<invoice" not in head:
+                    continue
             filename = safe_name(Path(info.filename).name, f"invoice_zip_{index}{ext}")
             saved = save_downloaded_artifact(payload, target_dir, filename, f"{prefix}_zip{index}", ext)
             artifacts.append(
@@ -1193,6 +1228,136 @@ def extract_zip_invoice_artifacts(
                 }
             )
     return artifacts
+
+
+def xml_local_name(tag: str) -> str:
+    return str(tag or "").rsplit("}", 1)[-1]
+
+
+def first_xml_text(root: ET.Element, *names: str) -> str:
+    wanted = {name.lower() for name in names}
+    for elem in root.iter():
+        if xml_local_name(elem.tag).lower() in wanted and elem.text and elem.text.strip():
+            return elem.text.strip()
+    return ""
+
+
+def nested_xml_text(root: ET.Element, parent_name: str, child_name: str) -> str:
+    for parent in root.iter():
+        if xml_local_name(parent.tag).lower() != parent_name.lower():
+            continue
+        for child in parent.iter():
+            if xml_local_name(child.tag).lower() == child_name.lower() and child.text and child.text.strip():
+                return child.text.strip()
+    return ""
+
+
+def decode_invoice_text(data: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def normalize_structured_invoice_kind(value: str) -> str:
+    text = str(value or "")
+    if "专用" in text:
+        return "增值税专用发票"
+    if "普通" in text or "电子发票" in text:
+        return "增值税普通发票"
+    return text.strip()
+
+
+def categorize_structured_invoice(*texts: str) -> str:
+    combined = "".join(texts)
+    if any(token in combined for token in ("餐饮", "餐费", "饭店", "餐厅", "酒楼", "美食")):
+        return "餐饮"
+    if any(token in combined for token in ("物流", "配送", "闪购")):
+        return "平台服务"
+    if any(token in combined for token in ("服装", "衣服")):
+        return "服装"
+    if any(token in combined for token in ("电脑", "手机", "平板", "电子计算机")):
+        return "电子设备"
+    return "其他"
+
+
+def parse_invoice_xml_bytes(data: bytes) -> tuple[dict[str, str], str]:
+    text = decode_invoice_text(data)
+    try:
+        root = ET.fromstring(text.encode("utf-8"))
+    except Exception:
+        fields = parse_invoice_fields_from_text(text)
+        return fields, text
+
+    fields: dict[str, str] = {}
+    fields["invoice_number"] = first_xml_text(root, "InvoiceNumber", "EIid", "InvoiceNo", "Fphm")
+    issue_time = first_xml_text(root, "IssueTime", "RequestTime", "Kprq", "InvoiceDate")
+    date_match = re.search(r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})", issue_time)
+    if date_match:
+        fields["invoice_date"] = f"{date_match.group(1)}-{int(date_match.group(2)):02d}-{int(date_match.group(3)):02d}"
+    fields["seller"] = first_xml_text(root, "SellerName", "Xsfmc")
+    fields["purchaser"] = first_xml_text(root, "BuyerName", "PurchaserName", "Gmfmc")
+    amount = first_xml_text(root, "TotalTax-includedAmount", "TotalTaxIncludedAmount", "TotalAmount", "Jshj")
+    if amount:
+        amount_match = re.search(r"([0-9,]+(?:\.[0-9]{1,2})?)", amount)
+        if amount_match:
+            fields["amount"] = f"{float(amount_match.group(1).replace(',', '')):.2f}"
+    general_type = nested_xml_text(root, "GeneralOrSpecialVAT", "LabelName")
+    invoice_type = nested_xml_text(root, "EInvoiceType", "LabelName")
+    fields["invoice_kind"] = normalize_structured_invoice_kind(general_type or invoice_type)
+    item_name = first_xml_text(root, "ItemName", "GoodsName", "Xmmc")
+    fields["category"] = categorize_structured_invoice(fields.get("seller", ""), item_name)
+
+    fallback = parse_invoice_fields_from_text(text)
+    for key, value in fallback.items():
+        fields.setdefault(key, value)
+    return {key: value for key, value in fields.items() if value}, text
+
+
+def parse_ofd_invoice_bytes(data: bytes) -> tuple[dict[str, str], str]:
+    texts: list[str] = []
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        return {}, ""
+    best_fields: dict[str, str] = {}
+    with archive:
+        for info in archive.infolist():
+            if info.is_dir() or not info.filename.lower().endswith(".xml") or info.file_size > 1024 * 1024:
+                continue
+            payload = archive.read(info)
+            fields, text = parse_invoice_xml_bytes(payload)
+            if text:
+                texts.append(text)
+            if has_minimum_invoice_fields(fields) and fields.get("invoice_number"):
+                return fields, text
+            if len(fields) > len(best_fields):
+                best_fields = fields
+    return best_fields, "\n".join(texts)
+
+
+def parse_structured_invoice_artifact(path: Path) -> dict[str, object]:
+    suffix = path.suffix.lower()
+    data = path.read_bytes()
+    if suffix == ".xml":
+        fields, raw_text = parse_invoice_xml_bytes(data)
+        engine = "xml_structured"
+    elif suffix == ".ofd":
+        fields, raw_text = parse_ofd_invoice_bytes(data)
+        engine = "ofd_structured"
+    else:
+        return {}
+    return {
+        "status": "parsed" if has_minimum_invoice_fields(fields) else "need_review",
+        "engine": engine,
+        "page_number": 1,
+        "page_count": 1,
+        "raw_text": raw_text[:20000],
+        "error": "" if has_minimum_invoice_fields(fields) else "structured_invoice_incomplete",
+        **fields,
+    }
 
 
 def fetch_apple_fdfinvoice_artifacts(
@@ -1333,6 +1498,15 @@ def download_invoice_links(
                     if zip_artifacts:
                         artifacts.extend(zip_artifacts)
                         continue
+                    unresolved.append(
+                        {
+                            "url": url,
+                            "platform": platform,
+                            "status": "Non_Invoice_Link",
+                            "note": "链接下载结果为 ZIP，但压缩包内未发现 PDF/OFD/XML 发票文件。",
+                        }
+                    )
+                    continue
                 saved, filename = save_response_artifact(resolved_url, disposition, data, target_dir, prefix, ext)
                 artifacts.append(
                     {
@@ -1359,6 +1533,17 @@ def download_invoice_links(
                         queued.append(nested_candidate)
                 if nested:
                     continue
+
+            if content_type.lower().startswith("image/"):
+                unresolved.append(
+                    {
+                        "url": url,
+                        "platform": platform,
+                        "status": "Non_Invoice_Link",
+                        "note": f"链接下载结果为图片，不是可解析发票文件；Content-Type={content_type[:80]}",
+                    }
+                )
+                continue
 
             unresolved.append(
                 {
@@ -2019,7 +2204,66 @@ def rows_for_saved_artifact(
                     "link_platform": link_platform,
                     "link_status": link_status,
                 }
+        )
+        return rows
+
+    if saved.suffix.lower() in {".xml", ".ofd"}:
+        parsed = parse_structured_invoice_artifact(saved)
+        fields = {
+            k: str(parsed.get(k, ""))
+            for k in (
+                "invoice_date",
+                "seller",
+                "purchaser",
+                "amount",
+                "invoice_code",
+                "invoice_number",
+                "invoice_kind",
+                "category",
             )
+        }
+        subject_hints = invoice_hints_from_subject(subject)
+        for key, value in subject_hints.items():
+            if value and not fields.get(key):
+                fields[key] = value
+        if not fields.get("category"):
+            fields["category"] = categorize_structured_invoice(fields.get("seller", ""), subject)
+        parse_status = str(parsed.get("status", "need_review"))
+        parse_engine = str(parsed.get("engine", f"{saved.suffix.lower().lstrip('.')}_structured"))
+        with OUTPUT_LOCK:
+            output_path, status = write_invoice_output(saved, fields)
+        note = str(parsed.get("error") or link_note or "")
+        rows.append(
+            {
+                "status": status,
+                "parse_status": parse_status,
+                "parse_engine": parse_engine,
+                "page_number": "1",
+                "page_count": "1",
+                "mail_subject": subject,
+                "mail_from": sender,
+                "mail_date": sent_at,
+                "mail_received_at": received_at,
+                "source_uid": uid_text,
+                "attachment_original_name": attachment_original_name,
+                "original_file": str(saved),
+                "output_file": str(output_path),
+                "sha256": file_sha256(output_path),
+                "invoice_date": fields.get("invoice_date", ""),
+                "seller": fields.get("seller", ""),
+                "purchaser": fields.get("purchaser", ""),
+                "amount": fields.get("amount", ""),
+                "invoice_code": fields.get("invoice_code", ""),
+                "invoice_number": fields.get("invoice_number", ""),
+                "invoice_kind": fields.get("invoice_kind", ""),
+                "category": fields.get("category", ""),
+                "links": " | ".join(dict.fromkeys(discovered_links[:20])),
+                "note": note,
+                "acquisition_method": acquisition_method,
+                "link_platform": link_platform,
+                "link_status": link_status,
+            }
+        )
         return rows
 
     rows.append(
@@ -2619,10 +2863,11 @@ def write_xlsx_report(rows: list[dict[str, str]], csv_path: Path) -> Path:
             statuses = " / ".join(sorted(set(str(value) for value in group["status"] if value)))
             link_values = [str(value) for value in group["links"] if str(value or "")]
             notes = [str(value) for value in group["note"] if str(value or "")]
+            judgement = "已标注：下载结果非发票" if set(group["status"]) == {"Non_Invoice_Link"} else "待下载/待解析"
             pending_records.append(
                 {
                     "状态": statuses,
-                    "判断": "待下载/待解析",
+                    "判断": judgement,
                     "邮件主题": first.get("mail_subject", ""),
                     "发票号码线索": first.get("subject_invoice_number", ""),
                     "金额线索": first.get("subject_amount", ""),
@@ -2724,7 +2969,7 @@ def write_xlsx_report(rows: list[dict[str, str]], csv_path: Path) -> Path:
             if value == "AI_Verified":
                 for col in range(1, ledger.max_column + 1):
                     ledger.cell(row=row, column=col).fill = yellow_fill
-            elif value in {"Need_Review", "Link_Need_Manual", "QR_Need_Manual"}:
+            elif value in {"Need_Review", "Link_Need_Manual", "QR_Need_Manual", "Non_Invoice_Link"}:
                 ledger.cell(row=row, column=status_col).fill = red_fill
             elif value == "Non_CN_Invoice":
                 ledger.cell(row=row, column=status_col).fill = gray_fill
