@@ -101,6 +101,41 @@ URL_RE = re.compile(r"https?://[^\s\"'<>）)]+", re.IGNORECASE)
 LINK_DOWNLOAD_TIMEOUT_SECONDS = 30
 MAX_LINK_DOWNLOAD_BYTES = 25 * 1024 * 1024
 MAX_LINK_CANDIDATES_PER_MAIL = 20
+BANK_STATEMENT_BRANDS = (
+    "招商银行",
+    "招商银行信用卡",
+    "民生银行",
+    "民生信用卡",
+    "中信银行",
+    "中信银行信用卡",
+    "中国工商银行",
+    "工商银行",
+    "icbc",
+    "za bank",
+    "bochk",
+)
+BANK_STATEMENT_HINTS = (
+    "对账单",
+    "电子对账单",
+    "电子账单",
+    "银行账单",
+    "信用卡账单",
+    "信用卡电子账单",
+    "客户对账单",
+    "bank statement",
+    "statement",
+    "结单",
+)
+BANK_SENDER_HINTS = (
+    "creditcard.cmbc.com.cn",
+    "message.cmbchina.com",
+    "icbc.com.cn",
+    "citicbank.com",
+    "bank.ecitic.com",
+    "za.group",
+    "za.bank",
+    "bochk.com",
+)
 LINK_INVOICE_HINTS = (
     "发票",
     "下载",
@@ -387,6 +422,95 @@ def looks_invoice_related(*texts: str) -> bool:
 def subject_has_invoice_keyword(subject: str) -> bool:
     subject_lower = (subject or "").lower()
     return any(keyword.lower() in subject_lower for keyword in SUBJECT_KEYWORDS)
+
+
+def is_bank_statement_email(subject: str, sender: str, body_text: str = "") -> bool:
+    header_text = f"{subject} {sender}".lower()
+    combined = f"{header_text} {body_text[:1500]}".lower()
+    has_bank_sender = any(hint in header_text for hint in BANK_SENDER_HINTS)
+    has_bank_brand = any(brand.lower() in combined for brand in BANK_STATEMENT_BRANDS)
+    has_statement_hint = any(hint.lower() in combined for hint in BANK_STATEMENT_HINTS)
+    return has_statement_hint and (has_bank_sender or has_bank_brand)
+
+
+def is_bank_statement_row(row: dict[str, str]) -> bool:
+    return is_bank_statement_email(
+        str(row.get("mail_subject") or ""),
+        str(row.get("mail_from") or ""),
+        " ".join(
+            str(row.get(key) or "")
+            for key in (
+                "seller",
+                "attachment_original_name",
+                "original_file",
+                "output_file",
+                "links",
+                "note",
+            )
+        ),
+    )
+
+
+def output_is_pdf(row: dict[str, str]) -> bool:
+    output_file = str(row.get("output_file") or row.get("original_file") or row.get("attachment_original_name") or "")
+    return Path(output_file).suffix.lower() == ".pdf"
+
+
+def dedupe_invoice_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    best_by_key: dict[tuple[str, str], tuple[int, int]] = {}
+
+    def row_score(row: dict[str, str]) -> int:
+        score = 0
+        if output_is_pdf(row):
+            score += 20
+        if row.get("invoice_number"):
+            score += 10
+        if row.get("seller"):
+            score += 5
+        if row.get("status") == "Parsed":
+            score += 3
+        if row.get("status") == "AI_Verified":
+            score += 2
+        if row.get("parse_status") == "parsed":
+            score += 1
+        return score
+
+    for index, row in enumerate(rows):
+        if row.get("status") not in {"Parsed", "AI_Verified"}:
+            continue
+        invoice_date = str(row.get("invoice_date") or "").strip()
+        amount = str(row.get("amount") or "").strip()
+        if not invoice_date or not amount:
+            continue
+        key = (invoice_date, amount)
+        score = row_score(row)
+        if key not in best_by_key or score > best_by_key[key][0]:
+            best_by_key[key] = (score, index)
+
+    keep_indexes = {best_index for _, best_index in best_by_key.values()}
+    deduped: list[dict[str, str]] = []
+    for index, row in enumerate(rows):
+        if row.get("status") in {"Parsed", "AI_Verified"}:
+            invoice_date = str(row.get("invoice_date") or "").strip()
+            amount = str(row.get("amount") or "").strip()
+            if invoice_date and amount and index not in keep_indexes:
+                continue
+        deduped.append(row)
+    return deduped
+
+
+def clean_manifest_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    filtered: list[dict[str, str]] = []
+    for row in rows:
+        status = str(row.get("status") or "")
+        if is_bank_statement_row(row):
+            continue
+        if status == "Non_CN_Invoice":
+            continue
+        if status in {"Downloaded_Raw_Attachment", "Link_Downloaded_Raw"} and not output_is_pdf(row):
+            continue
+        filtered.append(row)
+    return dedupe_invoice_rows(filtered)
 
 
 def extract_urls(*texts: str) -> list[str]:
@@ -1531,8 +1655,11 @@ def process_message_uid(
             return message_uid, "skipped_subject_filter", message_rows, ""
 
         plain, html_text = get_text_parts(msg)
-        related = subject_related or looks_invoice_related(subject, sender, plain, html_text)
         body_text = f"{plain}\n{re.sub(r'<[^>]+>', ' ', html_text or '')}"
+        if is_bank_statement_email(subject, sender, body_text):
+            return message_uid, "skipped_bank_statement", message_rows, ""
+
+        related = subject_related or looks_invoice_related(subject, sender, plain, html_text)
         link_candidates = select_invoice_link_candidates(
             extract_link_candidates(plain, html_text) if related else [],
             subject,
@@ -1804,6 +1931,7 @@ def scan_mailbox(
 
 def write_report(rows: list[dict[str, str]]) -> Path:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    rows = clean_manifest_rows(rows)
     report_path = REPORT_DIR / f"invoice_manifest_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     fieldnames = [
         "status",
@@ -1876,6 +2004,7 @@ def write_xlsx_report(rows: list[dict[str, str]], csv_path: Path) -> Path:
         "sha256",
         "source_uid",
     ]
+    rows = clean_manifest_rows(rows)
     df = pd.DataFrame(rows)
     for col in internal_columns:
         if col not in df.columns:
