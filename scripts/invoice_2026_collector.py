@@ -424,6 +424,29 @@ def subject_has_invoice_keyword(subject: str) -> bool:
     return any(keyword.lower() in subject_lower for keyword in SUBJECT_KEYWORDS)
 
 
+def invoice_hints_from_subject(subject: str) -> dict[str, str]:
+    hints: dict[str, str] = {}
+    text = subject or ""
+    seller_patterns = (
+        r"您收到一张【(.+?)】开具的",
+        r"您收到来自(.+?)的电子发票",
+        r"【电子发票】\s*(.+?)（发票金额",
+        r"电子发票下载\s+(.+?)-[0-9]{8,}",
+    )
+    for pattern in seller_patterns:
+        match = re.search(pattern, text)
+        if match:
+            hints["seller"] = match.group(1).strip()
+            break
+    number_match = re.search(r"发票号码[：:]?\s*([0-9A-Za-z-]+)", text)
+    if number_match:
+        hints["invoice_number"] = number_match.group(1).strip()
+    amount_match = re.search(r"发票金额[：:]?\s*([0-9,]+(?:\.[0-9]{1,2})?)", text)
+    if amount_match:
+        hints["amount"] = f"{float(amount_match.group(1).replace(',', '')):.2f}"
+    return hints
+
+
 def is_bank_statement_email(subject: str, sender: str, body_text: str = "") -> bool:
     header_text = f"{subject} {sender}".lower()
     combined = f"{header_text} {body_text[:1500]}".lower()
@@ -727,6 +750,68 @@ def fetch_url_bytes(url: str, env: dict[str, str], retry_attempts: int, retry_sl
     return retry_call(once, attempts=retry_attempts, sleep_seconds=retry_sleep, label=f"link download {urlparse(url).netloc}")
 
 
+def is_nuonuo_short_invoice_link(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if "nnfp.jss.com.cn" not in host:
+        return False
+    path = (parsed.path or "").strip("/")
+    return bool(path) and not path.startswith(("allow/", "scan-invoice/", "invoice/", "scan2/"))
+
+
+def fetch_nuonuo_pdf_artifact(
+    url: str,
+    env: dict[str, str],
+    retry_attempts: int,
+    retry_sleep: float,
+) -> tuple[bytes, str, str, str] | None:
+    headers = make_link_headers(env)
+    headers.setdefault("Referer", url)
+
+    def once() -> tuple[bytes, str, str, str] | None:
+        import httpx
+
+        with httpx.Client(follow_redirects=True, headers=headers, timeout=LINK_DOWNLOAD_TIMEOUT_SECONDS, trust_env=False) as client:
+            landing = client.get(url)
+            landing.raise_for_status()
+            resolved_url = str(landing.url or url)
+            query = dict(parse_qsl(urlparse(resolved_url).query, keep_blank_values=True))
+            param_list = query.get("paramList", "")
+            if not param_list:
+                return None
+            payload = {
+                "paramList": param_list,
+                "code": query.get("code", ""),
+                "aliView": query.get("aliView", ""),
+                "invoiceDetailMiddleUri": "",
+                "shortLinkSource": query.get("shortLinkSource", ""),
+            }
+            api = client.post(
+                "https://nnfp.jss.com.cn/scan2/getIvcDetailShow.do",
+                data=payload,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": headers["User-Agent"],
+                    "Referer": resolved_url,
+                },
+            )
+            api.raise_for_status()
+            body = api.json()
+            if str(body.get("status")) != "0000":
+                return None
+            invoice = ((body.get("data") or {}).get("invoiceSimpleVo") or {})
+            pdf_url = invoice.get("url") or ""
+            if not pdf_url:
+                return None
+            pdf = client.get(str(pdf_url), headers={"User-Agent": headers["User-Agent"], "Referer": resolved_url})
+            pdf.raise_for_status()
+            content_type = str(pdf.headers.get("Content-Type") or "application/pdf")
+            disposition = str(pdf.headers.get("Content-Disposition") or "")
+            return pdf.content, content_type, disposition, str(pdf.url or pdf_url)
+
+    return retry_call(once, attempts=retry_attempts, sleep_seconds=retry_sleep, label=f"Nuonuo invoice API {urlparse(url).netloc}")
+
+
 def save_downloaded_artifact(data: bytes, target_dir: Path, filename: str, prefix: str, ext: str) -> Path:
     target_dir.mkdir(parents=True, exist_ok=True)
     safe_filename = safe_name(filename, f"{prefix}{ext}")
@@ -803,6 +888,24 @@ def download_invoice_links(
         seen.add(url)
         platform = candidate.get("platform") or detect_link_platform(url)
         try:
+            if is_nuonuo_short_invoice_link(url):
+                nuonuo_result = fetch_nuonuo_pdf_artifact(url, env, retry_attempts, retry_sleep)
+                if nuonuo_result:
+                    data, content_type, disposition, resolved_url = nuonuo_result
+                    ext = infer_download_extension(resolved_url, content_type, disposition, data) or ".pdf"
+                    saved, filename = save_response_artifact(resolved_url, disposition, data, target_dir, prefix, ext)
+                    artifacts.append(
+                        {
+                            "path": str(saved),
+                            "original_name": filename,
+                            "source_url": url,
+                            "resolved_url": resolved_url,
+                            "platform": platform,
+                            "status": "Link_Downloaded",
+                        }
+                    )
+                    continue
+
             data, content_type, disposition, resolved_url = fetch_url_bytes(url, env, retry_attempts, retry_sleep)
             ext = infer_download_extension(resolved_url, content_type, disposition, data)
             if ext:
@@ -1432,6 +1535,15 @@ def rows_for_saved_artifact(
                     "category",
                 )
             }
+            subject_hints = invoice_hints_from_subject(subject)
+            for key, value in subject_hints.items():
+                if value and not fields.get(key):
+                    fields[key] = value
+            if not fields.get("category"):
+                if any(token in fields.get("seller", "") for token in ("餐饮", "饭店", "酒楼", "餐厅", "餐馆", "美食")):
+                    fields["category"] = "餐饮"
+                else:
+                    fields["category"] = "其他"
             page_number = int(parsed.get("page_number") or 1)
             page_count = int(parsed.get("page_count") or len(parsed_pages) or 1)
             parse_status = str(parsed.get("status", ""))
@@ -2019,6 +2131,88 @@ def write_xlsx_report(rows: list[dict[str, str]], csv_path: Path) -> Path:
         return str(fallback or "")
 
     df["ledger_file_name"] = [output_basename(row.output_file, row.attachment_original_name) for row in df.itertuples()]
+    valid_df = df[df["status"].isin(["Parsed", "AI_Verified"])].copy()
+    pending_df_source = df[~df["status"].isin(["Parsed", "AI_Verified"])].copy()
+
+    def extract_subject_invoice_number(subject: object) -> str:
+        match = re.search(r"发票号码[：:]?\s*([0-9A-Za-z-]+)", str(subject or ""))
+        return match.group(1) if match else ""
+
+    def extract_subject_amount(subject: object) -> str:
+        match = re.search(r"发票金额[：:]?\s*([0-9,]+(?:\.[0-9]{1,2})?)", str(subject or ""))
+        return f"{float(match.group(1).replace(',', '')):.2f}" if match else ""
+
+    def extract_subject_order(subject: object) -> str:
+        text = str(subject or "")
+        patterns = (
+            r"订单\s*([A-Za-z0-9-]{6,})",
+            r"订单【([A-Za-z0-9-]{6,})】",
+            r"invoice\s*\(#([A-Za-z0-9-]+)\)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        return ""
+
+    def pending_review_key(row: object) -> str:
+        invoice_number = str(row.get("subject_invoice_number") or "")  # type: ignore[attr-defined]
+        if invoice_number:
+            return f"invoice:{invoice_number}"
+        order_number = str(row.get("subject_order_number") or "")  # type: ignore[attr-defined]
+        if order_number:
+            return f"order:{order_number}"
+        amount = str(row.get("subject_amount") or "")  # type: ignore[attr-defined]
+        subject = str(row.get("mail_subject") or "")  # type: ignore[attr-defined]
+        if amount:
+            return f"subject_amount:{subject}|{amount}"
+        return f"uid_subject:{row.get('source_uid') or ''}|{subject}"  # type: ignore[attr-defined]
+
+    def useful_link(values: list[str]) -> str:
+        noise_tokens = ("w3.org", "baidu.com", "bilibili.com", "github.com", "nuonuo.com/", "nnwwxicon", "nnwzfblogo", "smartCode")
+        urls: list[str] = []
+        for value in values:
+            for url in re.findall(r"https?://[^\s|]+", str(value or "")):
+                if url not in urls:
+                    urls.append(url)
+        for url in urls:
+            if not any(token.lower() in url.lower() for token in noise_tokens):
+                return url
+        return ""
+
+    pending_records: list[dict[str, object]] = []
+    if not pending_df_source.empty:
+        pending_df_source["subject_invoice_number"] = pending_df_source["mail_subject"].map(extract_subject_invoice_number)
+        pending_df_source["subject_amount"] = pending_df_source["mail_subject"].map(extract_subject_amount)
+        pending_df_source["subject_order_number"] = pending_df_source["mail_subject"].map(extract_subject_order)
+        pending_df_source["review_key"] = pending_df_source.apply(pending_review_key, axis=1)
+        for _, group in pending_df_source.groupby("review_key", dropna=False):
+            first = group.iloc[0]
+            statuses = " / ".join(sorted(set(str(value) for value in group["status"] if value)))
+            link_values = [str(value) for value in group["links"] if str(value or "")]
+            notes = [str(value) for value in group["note"] if str(value or "")]
+            pending_records.append(
+                {
+                    "状态": statuses,
+                    "判断": "待下载/待解析",
+                    "邮件主题": first.get("mail_subject", ""),
+                    "发票号码线索": first.get("subject_invoice_number", ""),
+                    "金额线索": first.get("subject_amount", ""),
+                    "邮件接收时间": first.get("mail_received_at", ""),
+                    "发件人": first.get("mail_from", ""),
+                    "获取方式": " / ".join(sorted(set(str(value) for value in group["acquisition_method"] if value))),
+                    "链接平台": " / ".join(sorted(set(str(value) for value in group["link_platform"] if value))),
+                    "首选链接": useful_link(link_values),
+                    "线索行数": len(group),
+                    "备注": "；".join(dict.fromkeys(notes[:3])),
+                    "邮件UID": " / ".join(dict.fromkeys(str(value) for value in group["source_uid"] if value)),
+                }
+            )
+    pending_review_df = pd.DataFrame(
+        pending_records,
+        columns=["状态", "判断", "邮件主题", "发票号码线索", "金额线索", "邮件接收时间", "发件人", "获取方式", "链接平台", "首选链接", "线索行数", "备注", "邮件UID"],
+    )
+
     ledger_columns = [
         ("category", "发票类型"),
         ("invoice_date", "开票日期"),
@@ -2044,9 +2238,9 @@ def write_xlsx_report(rows: list[dict[str, str]], csv_path: Path) -> Path:
         ("note", "备注"),
         ("source_uid", "邮件UID"),
     ]
-    ledger_df = pd.DataFrame({header: df[source] for source, header in ledger_columns})
+    ledger_df = pd.DataFrame({header: valid_df[source] for source, header in ledger_columns})
+    detail_df = pd.DataFrame({header: df[source] for source, header in ledger_columns})
 
-    valid_df = df[df["status"].isin(["Parsed", "AI_Verified"])]
     category_summary = (
         valid_df.groupby("category", dropna=False)
         .agg(records=("status", "count"), total_amount=("amount_numeric", "sum"), ai_verified=("status", lambda s: int((s == "AI_Verified").sum())))
@@ -2067,10 +2261,12 @@ def write_xlsx_report(rows: list[dict[str, str]], csv_path: Path) -> Path:
     )
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
         ledger_df.to_excel(writer, sheet_name="发票台账", index=False)
+        pending_review_df.to_excel(writer, sheet_name="待确认线索", index=False)
         category_summary.to_excel(writer, sheet_name="分类汇总", index=False)
         kind_summary.to_excel(writer, sheet_name="增值税类型汇总", index=False)
+        detail_df.to_excel(writer, sheet_name="抓取明细", index=False)
         workbook = writer.book
-        for sheet_name in ("发票台账", "分类汇总", "增值税类型汇总"):
+        for sheet_name in ("发票台账", "待确认线索", "分类汇总", "增值税类型汇总", "抓取明细"):
             ws = workbook[sheet_name]
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
@@ -2081,6 +2277,7 @@ def write_xlsx_report(rows: list[dict[str, str]], csv_path: Path) -> Path:
             for column_cells in ws.columns:
                 max_len = max(len(str(cell.value or "")) for cell in column_cells[:200])
                 ws.column_dimensions[get_column_letter(column_cells[0].column)].width = min(max(max_len + 2, 10), 48)
+        workbook["抓取明细"].sheet_state = "hidden"
         ledger = workbook["发票台账"]
         ledger.freeze_panes = "A2"
         amount_col = list(ledger_df.columns).index("金额") + 1
