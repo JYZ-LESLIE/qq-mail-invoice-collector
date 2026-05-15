@@ -67,6 +67,8 @@ THREAD_LOCAL = threading.local()
 SUBJECT_KEYWORDS = (
     "发票",
     "电子发票",
+    "电票",
+    "数电票",
     "Invoice",
     "账单",
     "行程单",
@@ -90,6 +92,8 @@ LIKELY_INVOICE_KEYWORDS = (
     "数电票",
     "全电票",
     "开票",
+    "电票",
+    "数电票",
     "票据",
     "行程单",
     "报销",
@@ -107,6 +111,7 @@ URL_RE = re.compile(r"https?://[^\s\"'<>）)]+", re.IGNORECASE)
 LINK_DOWNLOAD_TIMEOUT_SECONDS = 30
 MAX_LINK_DOWNLOAD_BYTES = 25 * 1024 * 1024
 MAX_LINK_CANDIDATES_PER_MAIL = 20
+MAX_ATTACHMENT_PROBE_UIDS = 5000
 BANK_STATEMENT_BRANDS = (
     "招商银行",
     "招商银行信用卡",
@@ -422,6 +427,19 @@ def should_download_attachment(part: Message, filename: str) -> bool:
             return False
 
     return ext in DOWNLOAD_ATTACHMENT_EXTENSIONS or "发票" in name or "Invoice" in name or "invoice" in name
+
+
+def message_has_invoice_attachment(msg: Message) -> bool:
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        disposition = str(part.get("Content-Disposition") or "").lower()
+        filename = part.get_filename()
+        if "attachment" not in disposition and not filename:
+            continue
+        if should_download_attachment(part, part_filename(part)):
+            return True
+    return False
 
 
 def get_text_parts(msg: Message) -> tuple[str, str]:
@@ -1954,6 +1972,56 @@ def uid_search(
     return set(data[0].split()) if data and data[0] else set()
 
 
+def bodystructure_has_invoice_attachment(raw_parts: list[object]) -> bool:
+    chunks: list[bytes] = []
+    for item in raw_parts:
+        if isinstance(item, tuple):
+            chunks.extend(part for part in item if isinstance(part, bytes))
+        elif isinstance(item, bytes):
+            chunks.append(item)
+    text = b" ".join(chunks).decode("utf-8", errors="ignore")
+    decoded_text = decode_mime_words(text)
+    haystack = f"{text}\n{decoded_text}".lower()
+    return any(
+        token in haystack
+        for token in (
+            "application/pdf",
+            ".pdf",
+            ".ofd",
+            ".xml",
+            "application/vnd.openxmlformats-officedocument",
+        )
+    )
+
+
+def search_attachment_candidate_uids(
+    mail: imaplib.IMAP4_SSL,
+    uids: set[bytes],
+    *,
+    retry_attempts: int,
+    retry_sleep: float,
+    max_probe: int = MAX_ATTACHMENT_PROBE_UIDS,
+) -> set[bytes]:
+    result: set[bytes] = set()
+    ordered = sorted(uids, key=uid_sort_key, reverse=True)
+    if len(ordered) > max_probe:
+        print(f"Sample Calibration attachment probe skipped: date_matches={len(ordered)} exceeds max_probe={max_probe}")
+        return result
+    for uid in ordered:
+        try:
+            typ, data = retry_call(
+                lambda uid=uid: mail.uid("FETCH", uid, "(BODYSTRUCTURE)"),
+                attempts=retry_attempts,
+                sleep_seconds=retry_sleep,
+                label=f"IMAP attachment probe UID {uid.decode('ascii', errors='replace')}",
+            )
+        except Exception:
+            continue
+        if typ == "OK" and data and bodystructure_has_invoice_attachment(list(data)):
+            result.add(uid)
+    return result
+
+
 def search_invoice_candidate_uids(
     mail: imaplib.IMAP4_SSL,
     *,
@@ -1962,6 +2030,8 @@ def search_invoice_candidate_uids(
     retry_attempts: int,
     retry_sleep: float,
     limit: int | None,
+    enable_attachment_probe: bool = True,
+    max_attachment_probe: int = MAX_ATTACHMENT_PROBE_UIDS,
 ) -> list[bytes]:
     since_atom = date_to_imap(since)
     before_atom = date_to_imap(next_date(until))
@@ -2005,7 +2075,19 @@ def search_invoice_candidate_uids(
         except Exception as exc:
             print(f"Sample Calibration filter warning: sender domain '{domain}' skipped by IMAP server: {exc}")
 
-    candidate_uids = date_uids & subject_uids
+    attachment_uids = (
+        search_attachment_candidate_uids(
+            mail,
+            date_uids - subject_uids,
+            retry_attempts=retry_attempts,
+            retry_sleep=retry_sleep,
+            max_probe=max_attachment_probe,
+        )
+        if enable_attachment_probe
+        else set()
+    )
+
+    candidate_uids = (date_uids & subject_uids) | attachment_uids
     priority_sorted = sorted(candidate_uids & priority_uids, key=uid_sort_key)
     other_sorted = sorted(candidate_uids - priority_uids, key=uid_sort_key)
     ordered = sorted(candidate_uids, key=uid_sort_key, reverse=True)
@@ -2018,7 +2100,8 @@ def search_invoice_candidate_uids(
     print(
         "Sample Calibration IMAP filter: "
         f"date_matches={len(date_uids)}, subject_matches={len(subject_uids)}, "
-        f"priority_sender_matches={len(priority_uids)}, candidates={len(candidate_uids)}"
+        f"attachment_matches={len(attachment_uids)}, priority_sender_matches={len(priority_uids)}, "
+        f"candidates={len(candidate_uids)}"
     )
     return ordered
 
@@ -2431,11 +2514,13 @@ def process_message_uid(
         sent_at = parse_date(msg.get("Date"))
         received_at = parse_internal_date(fetched[0][0], sent_at)
         subject_related = subject_has_invoice_keyword(subject)
-        if not subject_related:
-            return message_uid, "skipped_subject_filter", message_rows, ""
-
         plain, html_text = get_text_parts(msg)
         body_text = f"{plain}\n{re.sub(r'<[^>]+>', ' ', html_text or '')}"
+        attachment_related = message_has_invoice_attachment(msg)
+        related = subject_related or attachment_related or looks_invoice_related(subject, sender, plain, html_text)
+        if not related:
+            return message_uid, "skipped_subject_filter", message_rows, ""
+
         if is_bank_statement_email(subject, sender, body_text):
             return message_uid, "skipped_bank_statement", message_rows, ""
         if is_non_reimbursable_email(subject, sender, body_text):
@@ -2443,7 +2528,6 @@ def process_message_uid(
         if is_deferred_platform_email(subject, sender, body_text):
             return message_uid, "skipped_deferred_platform", message_rows, ""
 
-        related = subject_related or looks_invoice_related(subject, sender, plain, html_text)
         link_candidates = select_invoice_link_candidates(
             extract_link_candidates(plain, html_text) if related else [],
             subject,
@@ -2654,6 +2738,8 @@ def scan_mailbox(
             retry_attempts=retry_attempts,
             retry_sleep=retry_sleep,
             limit=limit,
+            enable_attachment_probe=str(env.get("ENABLE_ATTACHMENT_PROBE", "1")).lower() not in {"0", "false", "no", "off"},
+            max_attachment_probe=int(env.get("MAX_ATTACHMENT_PROBE_UIDS", str(MAX_ATTACHMENT_PROBE_UIDS))),
         )
 
         rows: list[dict[str, str]] = []

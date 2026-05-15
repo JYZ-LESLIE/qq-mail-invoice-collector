@@ -41,6 +41,11 @@ non-invoice downloads are marked or excluded.
 - Do not send, delete, or move email.
 - Search by date window, invoice-related subject keywords, and known provider
   senders to avoid scanning the entire mailbox.
+- Subject keywords include `发票`, `电子发票`, `电票`, `数电票`, `Invoice`, `账单`,
+  and `行程单`.
+- For messages that do not match subject keywords, probe IMAP `BODYSTRUCTURE`
+  inside the date window. If an attachment filename or MIME structure suggests
+  PDF/OFD/XML invoice material, fetch and process the message anyway.
 
 ### Nuonuo / JSS
 
