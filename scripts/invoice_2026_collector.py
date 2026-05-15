@@ -162,6 +162,7 @@ LINK_INVOICE_HINTS = (
     "查看",
     "获取",
     "开票",
+    "打开链接",
     "pdf",
     "ofd",
     "xml",
@@ -184,6 +185,16 @@ LINK_NOISE_HINTS = (
     "preference",
     "logo",
     "banner",
+)
+BWJF_TRACKING_HOSTS = {
+    "bdopcs.bwjf.cn",
+}
+BWJF_TRACKING_PATH_MARKERS = (
+    "/v1/usereventtransforget",
+)
+BWJF_DOWNLOAD_URL_KEYS = (
+    "pdfurl",
+    "pdf_url",
 )
 DECORATIVE_IMAGE_NAME_HINTS = (
     "logo",
@@ -673,6 +684,50 @@ def normalize_invoice_link(url: str, base_url: str = "") -> str:
     return value.rstrip(".,;，。；")
 
 
+def is_bwjf_tracking_link(url: str) -> bool:
+    parsed = urlparse(str(url or ""))
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    if host in BWJF_TRACKING_HOSTS:
+        return True
+    return any(marker in path for marker in BWJF_TRACKING_PATH_MARKERS)
+
+
+def preferred_bwjf_pdf_url(url: str) -> str:
+    parsed = urlparse(str(url or ""))
+    for key, query_value in parse_qsl(parsed.query, keep_blank_values=True):
+        if key.lower() in BWJF_DOWNLOAD_URL_KEYS and query_value.startswith(("http://", "https://")):
+            return unquote(query_value).strip()
+    return ""
+
+
+def is_bwjf_pdf_download_url(url: str) -> bool:
+    parsed = urlparse(str(url or ""))
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    query = parsed.query.lower()
+    if host != "fp.bwjf.cn":
+        return False
+    if path.startswith("/downsigninvoice"):
+        return "jflx=ofd" not in query and "jflx=xml" not in query
+    return path.lower().endswith(".pdf")
+
+
+def is_bwjf_invoice_link(url: str) -> bool:
+    if is_bwjf_tracking_link(url):
+        return False
+    parsed = urlparse(str(url or ""))
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    if host == "fp.bwjf.cn" and (path.startswith("/u/") or path.startswith("/downsigninvoice")):
+        return True
+    if host == "www.bwjf.cn" and ("alleledeliverysuccess" in path or preferred_bwjf_pdf_url(url)):
+        return True
+    if host == "yjts.bwjf.cn":
+        return True
+    return False
+
+
 def extract_link_candidates(plain: str, html_text: str) -> list[dict[str, str]]:
     candidates: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -708,9 +763,13 @@ def detect_link_platform(url: str, sender: str = "", subject: str = "") -> str:
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     combined = f"{url} {sender} {subject}".lower()
+    if is_bwjf_tracking_link(url):
+        return "埋点链接"
     if any(token in host for token in ("nfp.jss.com.cn", "jss.com.cn", "nuonuo.com")):
         return "诺诺网/JSS"
-    if any(token in host for token in ("baiwang", "efapiao.com", "bwjf.cn")):
+    if is_bwjf_invoice_link(url):
+        return "云票/百望"
+    if any(token in host for token in ("baiwang", "efapiao.com")):
         return "百望/票通"
     if "chinatax.gov.cn" in host:
         return "税务平台直链"
@@ -743,10 +802,12 @@ def link_has_invoice_signal(candidate: dict[str, str], subject: str, sender: str
     parsed = urlparse(url)
     ext = Path(parsed.path).suffix.lower()
     platform = detect_link_platform(url, sender, subject)
+    if is_bwjf_tracking_link(url):
+        return False
     if ext in INVOICE_EXTENSIONS or ext in ARCHIVE_EXTENSIONS:
         return True
     has_link_hint = any(hint.lower() in link_text for hint in LINK_INVOICE_HINTS)
-    if platform in {"诺诺网/JSS", "百望/票通", "税务平台直链", "Apple硬件发票", "京东", "飞书", "淘宝闪购"}:
+    if platform in {"诺诺网/JSS", "云票/百望", "百望/票通", "税务平台直链", "Apple硬件发票", "京东", "飞书", "淘宝闪购"}:
         return True
     if platform != "未知平台" and has_link_hint:
         return True
@@ -761,6 +822,8 @@ def is_noise_link(candidate: dict[str, str], subject: str, sender: str, body_tex
     path = (parsed.path or "").lower()
     combined = f"{url} {anchor_text}".lower()
     mail_context = f"{subject} {sender} {body_text}".lower()
+    if is_bwjf_tracking_link(url):
+        return True
     if any(hint in combined for hint in LINK_NOISE_HINTS):
         return True
     if host in {"ns.adobe.com", "purl.org"}:
@@ -802,12 +865,18 @@ def link_candidate_priority(candidate: dict[str, str]) -> tuple[int, str]:
     url = candidate.get("url", "").lower()
     anchor = candidate.get("anchor_text", "").lower()
     ext = Path(urlparse(url).path).suffix.lower()
-    if ext in {".pdf", ".ofd", ".xml", ".zip"}:
+    if is_bwjf_tracking_link(url):
+        return (99, url)
+    if preferred_bwjf_pdf_url(url) or is_bwjf_pdf_download_url(url):
+        return (0, url)
+    if ext == ".pdf":
         return (0, url)
     if "fdfinvoice.com" in url:
         return (0, url)
-    if any(token in url for token in ("downloadpdf", "downloadofd", "downloadxml", "wjgs=pdf", "jflx=pdf")):
+    if any(token in url for token in ("downloadpdf", "wjgs=pdf", "jflx=pdf")):
         return (1, url)
+    if ext in {".ofd", ".xml", ".zip"} or any(token in url for token in ("downloadofd", "downloadxml", "wjgs=ofd", "wjgs=xml", "jflx=ofd", "jflx=xml")):
+        return (4, url)
     if any(token in f"{url} {anchor}" for token in ("下载", "download", "发票", "invoice")):
         return (2, url)
     return (3, url)
@@ -822,9 +891,16 @@ def make_link_headers(env: dict[str, str]) -> dict[str, str]:
 
 def infer_download_extension(url: str, content_type: str, content_disposition: str, data: bytes) -> str:
     combined = f"{url} {content_type} {content_disposition}".lower()
-    if data.startswith(b"PK\x03\x04") or "application/zip" in combined or ".zip" in combined:
+    stripped = data.lstrip()[:200].lower()
+    if data.startswith(b"%PDF"):
+        return ".pdf"
+    if data.startswith(b"PK\x03\x04"):
         return ".zip"
-    if data.startswith(b"%PDF") or "application/pdf" in combined or ".pdf" in combined or "wjgs=pdf" in combined or "jflx=pdf" in combined:
+    if "text/html" in content_type.lower() or stripped.startswith((b"<html", b"<!doctype html")):
+        return ""
+    if "application/zip" in combined or ".zip" in combined:
+        return ".zip"
+    if "application/pdf" in combined or ".pdf" in combined or "wjgs=pdf" in combined or "jflx=pdf" in combined or "pdfurl=" in combined or "pdfurl%3d" in combined:
         return ".pdf"
     if "ofd" in combined or ".ofd" in combined or "wjgs=ofd" in combined or "jflx=ofd" in combined:
         return ".ofd"
@@ -870,6 +946,95 @@ def fetch_url_bytes(url: str, env: dict[str, str], retry_attempts: int, retry_sl
         return data, content_type, disposition, resolved_url
 
     return retry_call(once, attempts=retry_attempts, sleep_seconds=retry_sleep, label=f"link download {urlparse(url).netloc}")
+
+
+def resolve_bwjf_pdf_url(url: str, env: dict[str, str], retry_attempts: int, retry_sleep: float) -> str:
+    if is_bwjf_tracking_link(url):
+        return ""
+    direct = preferred_bwjf_pdf_url(url)
+    if direct:
+        return direct
+    if is_bwjf_pdf_download_url(url):
+        return url
+
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    if host != "fp.bwjf.cn" or not path.startswith("/u/"):
+        return ""
+
+    headers = make_link_headers(env)
+
+    def once() -> str:
+        import httpx
+
+        with httpx.Client(
+            follow_redirects=False,
+            headers=headers,
+            timeout=LINK_DOWNLOAD_TIMEOUT_SECONDS,
+            trust_env=False,
+        ) as client:
+            response = client.get(url)
+        location = str(response.headers.get("Location") or "").strip()
+        if location:
+            resolved = urljoin(url, location)
+            nested = preferred_bwjf_pdf_url(resolved)
+            if nested:
+                return nested
+            if is_bwjf_pdf_download_url(resolved):
+                return resolved
+
+        with httpx.Client(
+            follow_redirects=True,
+            headers=headers,
+            timeout=LINK_DOWNLOAD_TIMEOUT_SECONDS,
+            trust_env=False,
+        ) as client:
+            response = client.get(url)
+            response.raise_for_status()
+        final_url = str(response.url or url)
+        nested = preferred_bwjf_pdf_url(final_url)
+        if nested:
+            return nested
+        text = response.text[:200000]
+        for candidate in html_candidate_links(text.encode("utf-8", errors="replace"), final_url):
+            candidate_url = candidate.get("url", "")
+            nested = preferred_bwjf_pdf_url(candidate_url)
+            if nested:
+                return nested
+            if is_bwjf_pdf_download_url(candidate_url):
+                return candidate_url
+        return ""
+
+    return retry_call(once, attempts=retry_attempts, sleep_seconds=retry_sleep, label=f"BWJF PDF resolve {urlparse(url).netloc}")
+
+
+def fetch_bwjf_pdf_artifact(
+    url: str,
+    env: dict[str, str],
+    target_dir: Path,
+    prefix: str,
+    retry_attempts: int,
+    retry_sleep: float,
+) -> list[dict[str, str]]:
+    pdf_url = resolve_bwjf_pdf_url(url, env, retry_attempts, retry_sleep)
+    if not pdf_url:
+        return []
+    data, content_type, disposition, resolved_url = fetch_url_bytes(pdf_url, env, retry_attempts, retry_sleep)
+    ext = infer_download_extension(resolved_url, content_type, disposition, data)
+    if ext != ".pdf":
+        return []
+    saved, filename = save_response_artifact(resolved_url, disposition, data, target_dir, prefix, ".pdf")
+    return [
+        {
+            "path": str(saved),
+            "original_name": filename,
+            "source_url": url,
+            "resolved_url": resolved_url,
+            "platform": "云票/百望",
+            "status": "Link_Downloaded",
+        }
+    ]
 
 
 def is_nuonuo_short_invoice_link(url: str) -> bool:
@@ -1127,6 +1292,19 @@ def download_invoice_links(
                 )
                 if apple_artifacts:
                     artifacts.extend(apple_artifacts)
+                    continue
+
+            if platform == "云票/百望" or is_bwjf_invoice_link(url):
+                bwjf_artifacts = fetch_bwjf_pdf_artifact(
+                    url,
+                    env,
+                    target_dir,
+                    prefix,
+                    retry_attempts,
+                    retry_sleep,
+                )
+                if bwjf_artifacts:
+                    artifacts.extend(bwjf_artifacts)
                     continue
 
             if is_nuonuo_short_invoice_link(url):

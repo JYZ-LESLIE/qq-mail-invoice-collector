@@ -8,6 +8,7 @@
 - 按日期、主题关键词和常见平台发件人缩小搜索范围，避免全邮箱暴力扫描。
 - 支持 PDF 附件、邮件正文链接、二维码链接接力下载。
 - 支持诺诺网/JSS 短链接接口解析，能从前端落地页继续找到真实 PDF 下载地址。
+- 支持云票/百望 `fp.bwjf.cn` 短链和 `allEleDeliverySuccess` 页面二跳，强制优先下载 PDF，并过滤 `bdopcs.bwjf.cn` 浏览埋点链接。
 - 支持 Apple 硬件发票页、飞书 zip 下载、淘宝闪购 zip 下载、京东直链 PDF 的专门解析。
 - 支持单个 PDF 多页多张发票。
 - 只纳入中国发票；海外 Invoice/Receipt 会标记为 `Non_CN_Invoice`。
