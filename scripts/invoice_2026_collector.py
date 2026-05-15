@@ -539,7 +539,7 @@ def output_is_pdf(row: dict[str, str]) -> bool:
 
 
 def dedupe_invoice_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
-    best_by_key: dict[tuple[str, str], tuple[int, int]] = {}
+    best_by_key: dict[tuple[str, ...], tuple[int, int]] = {}
 
     def row_score(row: dict[str, str]) -> int:
         score = 0
@@ -557,14 +557,22 @@ def dedupe_invoice_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
             score += 1
         return score
 
+    def row_dedupe_key(row: dict[str, str]) -> tuple[str, ...] | None:
+        invoice_number = str(row.get("invoice_number") or "").strip()
+        if invoice_number:
+            return ("invoice_number", invoice_number)
+        invoice_date = str(row.get("invoice_date") or "").strip()
+        amount = str(row.get("amount") or "").strip()
+        if invoice_date and amount:
+            return ("date_amount_without_number", invoice_date, amount)
+        return None
+
     for index, row in enumerate(rows):
         if row.get("status") not in {"Parsed", "AI_Verified"}:
             continue
-        invoice_date = str(row.get("invoice_date") or "").strip()
-        amount = str(row.get("amount") or "").strip()
-        if not invoice_date or not amount:
+        key = row_dedupe_key(row)
+        if not key:
             continue
-        key = (invoice_date, amount)
         score = row_score(row)
         if key not in best_by_key or score > best_by_key[key][0]:
             best_by_key[key] = (score, index)
@@ -573,9 +581,8 @@ def dedupe_invoice_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     deduped: list[dict[str, str]] = []
     for index, row in enumerate(rows):
         if row.get("status") in {"Parsed", "AI_Verified"}:
-            invoice_date = str(row.get("invoice_date") or "").strip()
-            amount = str(row.get("amount") or "").strip()
-            if invoice_date and amount and index not in keep_indexes:
+            key = row_dedupe_key(row)
+            if key and index not in keep_indexes:
                 continue
         deduped.append(row)
     return deduped
@@ -604,6 +611,7 @@ def clean_manifest_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         (str(row.get("invoice_date") or "").strip(), str(row.get("amount") or "").strip())
         for row in filtered
         if row.get("status") in {"Parsed", "AI_Verified"}
+        and not str(row.get("invoice_number") or "").strip()
         and str(row.get("invoice_date") or "").strip()
         and str(row.get("amount") or "").strip()
     }
@@ -623,7 +631,7 @@ def clean_manifest_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
             links = str(row.get("links") or "").lower()
             if invoice_number and invoice_number in parsed_numbers:
                 continue
-            if invoice_date and amount and (invoice_date, amount) in parsed_date_amount:
+            if not invoice_number and invoice_date and amount and (invoice_date, amount) in parsed_date_amount:
                 continue
             if uid and uid in parsed_uids and row.get("status") in {"Link_Need_Manual", "QR_Need_Manual"}:
                 continue
