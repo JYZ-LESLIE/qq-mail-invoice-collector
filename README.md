@@ -1,6 +1,22 @@
 # QQ Mail Invoice Collector
 
-一个本地运行的 QQ 邮箱发票整理工具：只读扫描邮箱，下载中国电子发票附件或正文链接中的发票，解析 PDF，按规则重命名归档，并生成 Excel 台账。
+本地运行的 QQ 邮箱中国电子发票整理工具。它会用只读 IMAP 扫描邮箱，
+自动下载附件、正文链接、二维码或平台落地页里的发票文件，解析 PDF/XML/OFD，
+按发票号码去重，归档原件，并生成适合人工审计和报销核对的 Excel 台账。
+
+> 这个项目的重点不是“把所有邮件附件都下载下来”，而是把一封邮件里真正能报销的中国发票识别出来。银行账单、海外 Invoice、行程单、Logo、图片签名、埋点链接和非发票文件都会被剔除或标注。
+
+## Why This Exists
+
+很多电子发票邮件并不直接带 PDF 附件。常见情况包括：
+
+- 邮件正文里只有“打开链接”或“查看电子发票文件”。
+- 发票平台落地页里还要再点一次“下载 PDF 文件”。
+- PDF 不可读，但 XML/OFD 里有完整结构化字段。
+- 同一张发票同时出现 PDF、OFD、XML、二维码、图片或重复邮件。
+- 邮件里混有银行账单、海外账单、行程单、Logo、广告图和统计埋点。
+
+这个工具把这些情况统一成一条规则：**一张真实中国发票，只进台账一次；非发票线索留在待确认页，不污染正式金额。**
 
 ## 能做什么
 
@@ -23,6 +39,18 @@
 - Excel 按人审视角输出：`发票台账` 只放正式发票，`待确认线索` 折叠同一发票/同一订单的失败线索，抓取明细默认隐藏。
 - `AI_Verified` 行会在 Excel 中浅黄色标记，金额列使用数值格式。
 
+详细平台规则见 [docs/INVOICE_RULES.md](docs/INVOICE_RULES.md)。
+
+## 输出结果
+
+运行后会生成一个包含多张工作表的 Excel：
+
+- `发票台账`：只放正式发票，可直接按金额求和。
+- `待确认线索`：折叠需要人工确认或已标注为非发票的链接。
+- `分类汇总`：按费用类别汇总张数和金额。
+- `增值税类型汇总`：区分普通发票和专用发票。
+- `抓取明细`：保留抓取证据，默认隐藏。
+
 ## 安装
 
 ```bash
@@ -35,7 +63,7 @@ python3 -m venv .venv
 复制模板并填写本机私密信息：
 
 ```bash
-cp .env.example .env
+cp .env.example invoice_mail.env
 ```
 
 需要填写：
@@ -45,20 +73,20 @@ cp .env.example .env
 - `START_DATE` / `END_DATE`：默认扫描日期窗口。
 - `MIMO_API_KEY`、`MIMO_CHAT_COMPLETIONS_URL`、`MIMO_MODEL`：小米 MiMo 视觉兜底配置。
 
-`.env` 不会进入 Git。
+`invoice_mail.env` / `.env` 不会进入 Git。
 
 ## 试跑
 
 建议先跑 5 封确认字段和汇总金额：
 
 ```bash
-.venv/bin/python scripts/invoice_2026_collector.py --env .env --since 2026-01-01 --until 2026-05-15 --limit 5
+.venv/bin/python scripts/invoice_2026_collector.py --env invoice_mail.env --since 2026-01-01 --until 2026-05-15 --limit 5
 ```
 
 确认没问题后去掉 `--limit`：
 
 ```bash
-.venv/bin/python scripts/invoice_2026_collector.py --env .env --since 2026-01-01 --until 2026-05-15
+.venv/bin/python scripts/invoice_2026_collector.py --env invoice_mail.env --since 2026-01-01 --until 2026-05-15
 ```
 
 所有运行产物会放在：
@@ -76,7 +104,7 @@ cp .env.example .env
 正常续跑会自动跳过已完成邮件。若需要强制重跑同一时间窗口：
 
 ```bash
-.venv/bin/python scripts/invoice_2026_collector.py --env .env --since 2026-01-01 --until 2026-05-15 --reprocess
+.venv/bin/python scripts/invoice_2026_collector.py --env invoice_mail.env --since 2026-01-01 --until 2026-05-15 --reprocess
 ```
 
 ## GitHub 上传前注意
