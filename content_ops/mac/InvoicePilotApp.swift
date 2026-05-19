@@ -11,6 +11,7 @@ private let ledgerURL = invoiceRoot.appendingPathComponent("台账")
 private let ledgerInvoiceFoldersURL = invoiceRoot.appendingPathComponent("台账对应发票")
 private let ledgerFolderRunnerURL = workspaceRoot.appendingPathComponent("content_ops/scripts/ledger_invoice_folder.py")
 private let reimbursementRootURL = invoiceRoot.appendingPathComponent("报销管理")
+private let reimbursementPoolFilesURL = reimbursementRootURL.appendingPathComponent("累计池发票文件")
 private let reimbursementRunnerURL = workspaceRoot.appendingPathComponent("content_ops/scripts/reimbursement_manager.py")
 private let reviewURL = invoiceRoot.appendingPathComponent("人工复核")
 private let reviewCleanupRunnerURL = workspaceRoot.appendingPathComponent("content_ops/scripts/review_cleanup.py")
@@ -246,6 +247,9 @@ struct ReimbursementStatus: Codable {
     var duplicateInvoiceFiles: Int?
     var duplicateInvoiceFileGroups: Int?
     var duplicateManifest: String?
+    var poolRejectedCsv: String?
+    var poolRejectedRows: Int?
+    var poolRejectedByReason: [String: Int]?
 
     enum CodingKeys: String, CodingKey {
         case status
@@ -280,6 +284,9 @@ struct ReimbursementStatus: Codable {
         case duplicateInvoiceFiles = "duplicate_invoice_files"
         case duplicateInvoiceFileGroups = "duplicate_invoice_file_groups"
         case duplicateManifest = "duplicate_manifest"
+        case poolRejectedCsv = "pool_rejected_csv"
+        case poolRejectedRows = "pool_rejected_rows"
+        case poolRejectedByReason = "pool_rejected_by_reason"
     }
 }
 
@@ -758,11 +765,48 @@ final class InvoiceAppModel: ObservableObject {
 
     func openURL(path: String) {
         guard !path.isEmpty else { return }
-        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            let message = "找不到文件：\(url.path)"
+            if selectedSection == .reimbursement {
+                reimbursementError = message
+            } else {
+                lastError = message
+            }
+            return
+        }
+        if !NSWorkspace.shared.open(url) {
+            let message = "打不开文件：\(url.path)"
+            if selectedSection == .reimbursement {
+                reimbursementError = message
+            } else {
+                lastError = message
+            }
+        }
     }
 
-    func openFolder(_ url: URL) {
-        NSWorkspace.shared.open(url)
+    @discardableResult
+    func openFolder(_ url: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            let message = "找不到文件夹：\(url.path)"
+            if selectedSection == .reimbursement {
+                reimbursementError = message
+            } else {
+                lastError = message
+            }
+            return false
+        }
+        if NSWorkspace.shared.open(url) {
+            return true
+        }
+        let message = "打不开文件夹：\(url.path)"
+        if selectedSection == .reimbursement {
+            reimbursementError = message
+        } else {
+            lastError = message
+        }
+        return false
     }
 
     func loadReimbursementStatus() {
@@ -885,6 +929,122 @@ final class InvoiceAppModel: ObservableObject {
                 }
             }
         }
+    }
+
+    func openPreparedOrPrepareReimbursementInvoiceFolder(scope: String) {
+        let readableScope = scope == "all" ? "累计池全部发票" : "本轮待报销发票"
+        let folderName = scope == "all" ? "全部累计发票" : "本轮待报销发票"
+        let folderURL = reimbursementPoolFilesURL.appendingPathComponent(folderName)
+        let manifestURL = folderURL.appendingPathComponent("发票文件清单.csv")
+        if preparedReimbursementFolderIsCurrent(scope: scope, folderURL: folderURL, manifestURL: manifestURL) {
+            reimbursementError = ""
+            if openFolder(folderURL) {
+                reimbursementLogText = "已打开\(readableScope)文件夹。\n"
+            }
+            return
+        }
+        prepareAndOpenReimbursementInvoiceFolder(scope: scope)
+    }
+
+    private func preparedReimbursementFolderIsCurrent(scope: String, folderURL: URL, manifestURL: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: folderURL.path, isDirectory: &isDirectory),
+              isDirectory.boolValue,
+              FileManager.default.fileExists(atPath: manifestURL.path) else {
+            return false
+        }
+        let expectedRows = scope == "all" ? (reimbursementStatus.totalInvoices ?? 0) : (reimbursementStatus.pendingInvoices ?? 0)
+        guard let manifestPaths = manifestInvoiceFilePaths(at: manifestURL, inside: folderURL) else { return false }
+        guard expectedRows > 0,
+              manifestPaths.count == expectedRows,
+              regularFileCount(in: folderURL, excluding: manifestURL) == expectedRows else {
+            return false
+        }
+        guard let manifestDate = fileModifiedDate(manifestURL) else { return false }
+        let poolDate = fileModifiedDate(URL(fileURLWithPath: reimbursementStatus.poolXlsx ?? ""))
+            ?? fileModifiedDate(URL(fileURLWithPath: reimbursementStatus.poolCsv ?? ""))
+        guard let poolDate, manifestDate >= poolDate else { return false }
+        return manifestPaths.allSatisfy { FileManager.default.fileExists(atPath: $0) }
+    }
+
+    private func manifestInvoiceFilePaths(at url: URL, inside folderURL: URL) -> Set<String>? {
+        guard let rows = csvRows(at: url), let header = rows.first else { return nil }
+        guard let fileColumn = header.firstIndex(of: "发票文件") else { return nil }
+        let folderPath = folderURL.standardizedFileURL.path
+        var paths = Set<String>()
+        for row in rows.dropFirst() {
+            guard fileColumn < row.count else { return nil }
+            let filePath = URL(fileURLWithPath: row[fileColumn]).standardizedFileURL.path
+            guard !filePath.isEmpty, filePath.hasPrefix(folderPath + "/") else { return nil }
+            paths.insert(filePath)
+        }
+        return paths
+    }
+
+    private func csvRows(at url: URL) -> [[String]]? {
+        guard let contents = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        var rows: [[String]] = []
+        var row: [String] = []
+        var field = ""
+        var inQuotes = false
+        var iterator = contents.makeIterator()
+        while let char = iterator.next() {
+            if char == "\"" {
+                if inQuotes, let next = iterator.next() {
+                    if next == "\"" {
+                        field.append("\"")
+                    } else {
+                        inQuotes = false
+                        if next == "," {
+                            row.append(field)
+                            field = ""
+                        } else if next == "\n" {
+                            row.append(field)
+                            rows.append(row)
+                            row = []
+                            field = ""
+                        } else if next != "\r" {
+                            field.append(next)
+                        }
+                    }
+                } else {
+                    inQuotes.toggle()
+                }
+            } else if char == "," && !inQuotes {
+                row.append(field)
+                field = ""
+            } else if char == "\n" && !inQuotes {
+                row.append(field)
+                rows.append(row)
+                row = []
+                field = ""
+            } else if char != "\r" || inQuotes {
+                field.append(char)
+            }
+        }
+        if !field.isEmpty || !row.isEmpty {
+            row.append(field)
+            rows.append(row)
+        }
+        return rows.filter { !$0.allSatisfy { $0.isEmpty } }
+    }
+
+    private func regularFileCount(in folderURL: URL, excluding excludedURL: URL) -> Int {
+        guard let enumerator = FileManager.default.enumerator(at: folderURL, includingPropertiesForKeys: [.isRegularFileKey]) else {
+            return 0
+        }
+        var count = 0
+        for case let fileURL as URL in enumerator where fileURL.path != excludedURL.path {
+            if (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+                count += 1
+            }
+        }
+        return count
+    }
+
+    private func fileModifiedDate(_ url: URL) -> Date? {
+        guard !url.path.isEmpty else { return nil }
+        return try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date
     }
 
     func prepareAndOpenLedgerInvoiceFolder(for ledgerPath: String) {
@@ -1757,6 +1917,7 @@ struct ReimbursementView: View {
                 nextRoundView
                 historyView
                 issueView
+                rejectedPoolView
                 fileEntrancesView
                 if !model.reimbursementError.isEmpty {
                     noticeView(title: "需要处理", message: model.reimbursementError, systemImage: "exclamationmark.triangle.fill", color: .orange)
@@ -1840,7 +2001,7 @@ struct ReimbursementView: View {
                 }
                 .disabled((model.reimbursementStatus.poolXlsx ?? "").isEmpty)
                 Button {
-                    model.prepareAndOpenReimbursementInvoiceFolder(scope: "pending")
+                    model.openPreparedOrPrepareReimbursementInvoiceFolder(scope: "pending")
                 } label: {
                     Label("打开对应发票文件夹", systemImage: "folder")
                 }
@@ -1941,6 +2102,47 @@ struct ReimbursementView: View {
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
+    private var rejectedPoolView: some View {
+        let rows = model.reimbursementStatus.poolRejectedRows ?? 0
+        return Group {
+            if rows > 0 {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Label("未进入报销池", systemImage: "line.3.horizontal.decrease.circle")
+                            .font(.title3.weight(.semibold))
+                            .foregroundStyle(.orange)
+                        Spacer()
+                        Button {
+                            model.openURL(path: model.reimbursementStatus.poolRejectedCsv ?? "")
+                        } label: {
+                            Label("打开清单", systemImage: "doc.plaintext")
+                        }
+                        .disabled((model.reimbursementStatus.poolRejectedCsv ?? "").isEmpty)
+                    }
+                    Text("\(rows) 条记录没有进入累计池。下面是系统返回的主要原因，打开清单可以逐条查看。")
+                        .foregroundStyle(.secondary)
+                    if let reasons = model.reimbursementStatus.poolRejectedByReason, !reasons.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(reasons.sorted(by: { $0.value > $1.value }).prefix(4), id: \.key) { reason, count in
+                                HStack {
+                                    Text(reason)
+                                        .lineLimit(1)
+                                    Spacer()
+                                    Text("\(count)")
+                                        .monospacedDigit()
+                                        .foregroundStyle(.secondary)
+                                }
+                                .font(.caption)
+                            }
+                        }
+                    }
+                }
+                .padding(18)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
+        }
+    }
+
     private var fileEntrancesView: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("常用入口")
@@ -1958,7 +2160,7 @@ struct ReimbursementView: View {
                     Label("报销总文件夹", systemImage: "folder")
                 }
                 Button {
-                    model.prepareAndOpenReimbursementInvoiceFolder(scope: "all")
+                    model.openPreparedOrPrepareReimbursementInvoiceFolder(scope: "all")
                 } label: {
                     Label("累计池全部发票", systemImage: "folder.fill")
                 }
