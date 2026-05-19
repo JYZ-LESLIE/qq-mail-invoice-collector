@@ -41,6 +41,8 @@ if [ "$NEEDS_PREPARE" = "1" ]; then
   "$ROOT/准备发票管家.command"
 fi
 
+echo "当前版本：$("$BINARY" --version)"
+
 if pgrep -f "$APP_PROCESS" >/dev/null 2>&1; then
   echo "检测到发票管家已在运行，正在重新打开最新版本..."
   osascript -e 'tell application "发票管家" to quit' >/dev/null 2>&1 || true

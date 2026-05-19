@@ -2,6 +2,9 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
+private let appVersion = "0.1.4"
+private let appBuild = "20260519.4"
+private let appEdition = "运行层自检版"
 private let workspaceRoot = Bundle.main.bundleURL.deletingLastPathComponent()
 private let invoiceRoot = workspaceRoot.appendingPathComponent("发票整理")
 private let runnerURL = workspaceRoot.appendingPathComponent("content_ops/scripts/invoice_multi_account_runner.py")
@@ -1591,6 +1594,17 @@ struct SidebarView: View {
             }
 
             Spacer()
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("版本 \(appVersion)")
+                    .font(.caption.weight(.semibold))
+                Text("\(appEdition) · build \(appBuild)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 18)
+            .padding(.bottom, 14)
         }
         .background(.regularMaterial)
         .toolbar {
@@ -2749,7 +2763,11 @@ struct InvoicePilotApp: App {
     init() {
         let arguments = ProcessInfo.processInfo.arguments
         if arguments.contains("--self-test") {
-            print("发票管家 self-test: binary ok")
+            print("发票管家 self-test: binary ok version \(appVersion) build \(appBuild)")
+            exit(0)
+        }
+        if arguments.contains("--version") {
+            print("\(appVersion) (\(appEdition), build \(appBuild))")
             exit(0)
         }
         if arguments.contains("--demo-smoke-test") {
@@ -2774,6 +2792,18 @@ struct InvoicePilotApp: App {
         .windowStyle(.titleBar)
         .defaultSize(width: 1180, height: 760)
         .commands {
+            CommandGroup(replacing: .appInfo) {
+                Button("关于发票管家") {
+                    NSApplication.shared.orderFrontStandardAboutPanel(options: [
+                        .applicationName: "发票管家",
+                        .applicationVersion: appVersion,
+                        .version: appBuild,
+                        .credits: NSAttributedString(
+                            string: "\(appEdition)\n\n当前版本包含报销运行层自检、累计池质量规则、对应发票文件夹校验。"
+                        )
+                    ])
+                }
+            }
             CommandMenu("发票") {
                 Button("开始整理") {
                     model.runCollection()

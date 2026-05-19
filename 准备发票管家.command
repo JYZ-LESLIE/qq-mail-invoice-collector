@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
 echo "首次准备/修复发票管家..."
+echo "覆盖安装只会更新 发票管家.app，不会删除 发票整理 里的台账、附件、报销池、人工复核和私密配置。"
 
 if [ ! -x "content_ops/invoices/.venv/bin/python" ]; then
   python3 -m venv content_ops/invoices/.venv
