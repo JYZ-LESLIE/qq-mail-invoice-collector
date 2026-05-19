@@ -1,8 +1,8 @@
 # Invoice Recovery Rules
 
-This document records the operational rules used by the collector. The goal is
-to keep the ledger close to how a person audits invoices: one real reimbursable
-Chinese invoice becomes one ledger row, while statements, tracking links, and
+This document records the operational rules used by 发票管家. The goal is to keep
+the ledger close to how a person audits invoices: one real reimbursable Chinese
+invoice becomes one ledger row, while statements, tracking links, and
 non-invoice downloads are marked or excluded.
 
 ## Core Scope
@@ -14,7 +14,10 @@ non-invoice downloads are marked or excluded.
   民生银行, 中信银行, 工商银行, ZA Bank, and BOCHK.
 - Exclude Ctrip / Trip Chinese-English itineraries and travel confirmations
   when they are not tax invoices.
-- Defer iCloud subscription invoices to a separate flow.
+- Keep iCloud subscription records in a separate read-only exchange workflow
+  until a formal replacement invoice exists.
+- Do not assume a single reimbursement subject. The purchaser can be different
+  companies or individuals depending on the invoice.
 
 ## Dedupe
 
@@ -22,6 +25,9 @@ non-invoice downloads are marked or excluded.
 - If an invoice number is missing, use `invoice_date + amount` as a fallback.
 - Prefer parsed PDF records when multiple formats exist for the same invoice.
 - Keep non-invoice evidence only in review sheets, never in the formal ledger.
+- If two ledger rows point to the same original invoice file, treat that as a
+  data-quality problem. Merge only when the fields are non-conflicting; block
+  reimbursement preparation when conflicting duplicates remain.
 
 ## Link Handling
 
@@ -81,7 +87,10 @@ non-invoice downloads are marked or excluded.
 
 - Hardware invoice pages under `fdfinvoice.com` are recoverable and should be
   downloaded automatically.
-- iCloud subscription invoices are deferred.
+- Reissued Apple hardware invoices should preserve the order relation. Personal
+  originals remain evidence; company reissued invoices are the reimbursable row.
+- iCloud subscription invoices are handled by the separate read-only iCloud
+  exchange workflow.
 
 ### JD / Feishu
 
@@ -96,3 +105,34 @@ non-invoice downloads are marked or excluded.
 - `抓取明细` is retained for audit but hidden by default.
 - `AI_Verified` rows are highlighted for manual spot checks.
 - Amount columns use numeric formatting for direct Excel summation.
+
+## Reimbursement Pool
+
+- `累计发票池` is the long-running source for reimbursement preparation.
+- Starting a new reimbursement round should exclude invoices that were already
+  marked reimbursed in historical batches.
+- `prepare-files --scope pending` prepares a folder containing the current
+  pending invoice files, so the Excel summary and the actual PDFs can be checked
+  together.
+- Missing files are reported before reimbursement preparation; the tool does
+  not silently submit an incomplete batch.
+- Non-current-year files in manual review can be moved out of the active review
+  queue, but unknown dates stay for human review.
+
+## Vision Fallback
+
+- Text and structured XML/OFD parsing are preferred.
+- Vision models are used only for ambiguous cases such as image-only invoices,
+  missing parties, suspicious party reversal, or layout extraction failures.
+- The default local route is LM Studio `qwen3-vl-30b-a3b-instruct`.
+- Ollama `qwen3-vl-8b-eagle:latest` is a local backup.
+- Text-only models should not be used for invoice images unless explicitly
+  overridden for testing.
+
+## iCloud Exchange Flow
+
+- The iCloud flow is read-only in this project.
+- It may scan local evidence, build a month list, link to reports, and maintain
+  an archive checklist.
+- It must not automatically submit a replacement invoice application or send
+  company billing information.
