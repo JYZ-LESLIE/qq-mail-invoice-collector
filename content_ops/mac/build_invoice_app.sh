@@ -8,6 +8,8 @@ CONTENTS="$APP_DIR/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 BINARY="$MACOS/发票管家"
+ICON_SOURCE="$ROOT/content_ops/mac/InvoicePilotIcon.icns"
+ICON_TARGET="$RESOURCES/InvoicePilotIcon.icns"
 
 case "$DATA_DIR" in
   "$APP_DIR"|"$APP_DIR"/*)
@@ -25,6 +27,10 @@ swiftc \
   "$ROOT/content_ops/mac/InvoicePilotApp.swift" \
   -o "$BINARY"
 
+if [ -f "$ICON_SOURCE" ]; then
+  cp "$ICON_SOURCE" "$ICON_TARGET"
+fi
+
 cat > "$CONTENTS/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -37,6 +43,8 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
   <string>发票管家</string>
   <key>CFBundleIdentifier</key>
   <string>com.local.invoicepilot</string>
+  <key>CFBundleIconFile</key>
+  <string>InvoicePilotIcon</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
@@ -44,9 +52,9 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.4</string>
+  <string>0.1.5</string>
   <key>CFBundleVersion</key>
-  <string>20260519.4</string>
+  <string>20260519.5</string>
   <key>LSMinimumSystemVersion</key>
   <string>26.0</string>
   <key>NSHighResolutionCapable</key>

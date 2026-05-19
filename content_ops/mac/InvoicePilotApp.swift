@@ -2,9 +2,9 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-private let appVersion = "0.1.4"
-private let appBuild = "20260519.4"
-private let appEdition = "运行层自检版"
+private let appVersion = "0.1.5"
+private let appBuild = "20260519.5"
+private let appEdition = "带图标数据安全版"
 private let workspaceRoot = Bundle.main.bundleURL.deletingLastPathComponent()
 private let invoiceRoot = workspaceRoot.appendingPathComponent("发票整理")
 private let runnerURL = workspaceRoot.appendingPathComponent("content_ops/scripts/invoice_multi_account_runner.py")
