@@ -1,0 +1,37 @@
+# Copy this file to:
+#   发票整理/私密配置/accounts.yaml
+#
+# Keep real emails, authorization codes, and API keys in:
+#   发票整理/私密配置/invoice_mail.env
+#
+# The collector uses read-only IMAP. It does not send, delete, or move mail.
+
+global_env: 发票整理/私密配置/invoice_mail.env
+
+accounts:
+  - id: qq_main
+    label: QQ 邮箱
+    provider: qqmail
+    enabled: true
+    email_env: QQ_EMAIL
+    auth_code_env: QQ_IMAP_AUTH_CODE
+    imap_host: imap.qq.com
+    imap_port: 993
+    mailbox: INBOX
+
+  - id: aliyun_main
+    label: 阿里邮箱
+    provider: aliyun
+    enabled: false
+    # Fill these in invoice_mail.env after you get the Ali Mail client password.
+    email_env: ALIYUN_EMAIL
+    auth_code_env: ALIYUN_IMAP_AUTH_CODE
+    # Enterprise Ali Mail usually uses imap.qiye.aliyun.com.
+    # Personal Ali Mail may use imap.aliyun.com.
+    imap_host: imap.qiye.aliyun.com
+    imap_port: 993
+    mailbox: INBOX
+    imap_timeout_seconds: 30
+    # Ali enterprise IMAP can reject Chinese SUBJECT searches. Date-only keeps
+    # the server-side window and lets the local invoice filter finish the job.
+    search_mode: date_only
