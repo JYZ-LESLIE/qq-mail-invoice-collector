@@ -28,6 +28,7 @@ ROUNDS_DIR = REIMBURSEMENT_ROOT / "报销批次"
 POOL_FILES_DIR = REIMBURSEMENT_ROOT / "累计池发票文件"
 POOL_CSV = REIMBURSEMENT_ROOT / "累计发票池.csv"
 POOL_XLSX = REIMBURSEMENT_ROOT / "累计发票池.xlsx"
+POOL_REJECTED_CSV = REIMBURSEMENT_ROOT / "累计池不入池清单.csv"
 VALID_STATUSES = {"Parsed", "AI_Verified", "已解析", "AI复核"}
 UNREIMBURSED = "未报销"
 IN_ROUND = "已入批次待提交"
@@ -51,6 +52,48 @@ POOL_COLUMNS = [
     "报销文件夹",
     "备注",
 ]
+
+REJECTION_COLUMNS = [
+    "原因",
+    "状态",
+    "发票号码",
+    "开票日期",
+    "收款方",
+    "付款方",
+    "金额",
+    "发票文件",
+    "来源台账",
+    "邮件主题",
+    "备注",
+]
+
+FOREIGN_RECEIPT_MARKERS = (
+    "auckland",
+    "new zealand",
+    "united states",
+    "usd",
+    "eur",
+    "gbp",
+    "nzd",
+    " aud",
+    "cad",
+    "seats.aero",
+    "intercontinental auckland",
+    "your receipt",
+    "receipt from",
+    "amount due",
+)
+
+BAD_PARTY_VALUES = {
+    "销",
+    "购",
+    "名称",
+    "名称_",
+    "销售方",
+    "购买方",
+    "纳税人识别号",
+    "开票人",
+}
 
 
 def now_text() -> str:
@@ -80,6 +123,54 @@ def amount_text(value: object) -> str:
         return f"{float(text):.2f}"
     except ValueError:
         return text
+
+
+def has_chinese(value: object) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", str(value or "")))
+
+
+def normalized_invoice_number(value: object) -> str:
+    return str(value or "").strip().replace(" ", "")
+
+
+def is_china_tax_invoice_number(value: object) -> bool:
+    number = normalized_invoice_number(value)
+    return bool(re.fullmatch(r"\d{8,24}", number))
+
+
+def is_apple_personal_receipt_number(value: object) -> bool:
+    return bool(re.fullmatch(r"MC\d{6,}", normalized_invoice_number(value), flags=re.IGNORECASE))
+
+
+def party_quality_issue(value: object, *, allow_personal: bool = False) -> str:
+    text = str(value or "").strip()
+    normalized = re.sub(r"\s+", "", text)
+    if not text:
+        return "关键字段空白"
+    if allow_personal and normalized in {"个人", "季元征", "季元徵"}:
+        return ""
+    if normalized in BAD_PARTY_VALUES or normalized.startswith("名称_"):
+        return "识别到票面标签，不是公司/个人名称"
+    if not has_chinese(text):
+        return "不是中文税票主体"
+    if len(normalized) < 2:
+        return "主体名称过短"
+    return ""
+
+
+def row_text(row: dict[str, str], *extra_values: object) -> str:
+    values = list(extra_values)
+    values.extend(row.get(key, "") for key in row.keys())
+    return " ".join(str(value or "") for value in values)
+
+
+def foreign_receipt_reason(row: dict[str, str]) -> str:
+    combined = row_text(row).lower()
+    if any(marker in combined for marker in FOREIGN_RECEIPT_MARKERS):
+        return "海外收据/外币账单，不是中国税务发票"
+    if "$" in combined and not any(marker in combined for marker in ("增值税", "数电", "电子发票")):
+        return "外币符号账单，不是中国税务发票"
+    return ""
 
 
 def invoice_key(row: dict[str, str]) -> str:
@@ -191,15 +282,61 @@ def normalize_pool_parties(row: dict[str, str], source_row: dict[str, str] | Non
     return row
 
 
-def should_pool_row(row: dict[str, str]) -> bool:
+def pool_rejection_reason(row: dict[str, str]) -> str:
     status = row_value(row, "status", "状态")
     include = row_value(row, "include_in_summary", "计入汇总") or "是"
     output_file = row_value(row, "output_file", "整理后文件", "发票文件")
     if status and status not in VALID_STATUSES:
-        return False
+        return "未解析成功，保留在人工复核/线索区"
     if include == "否":
-        return False
-    return bool(output_file)
+        return "已标记不计入汇总"
+    if not output_file:
+        return "缺少发票文件"
+
+    foreign_reason = foreign_receipt_reason(row)
+    if foreign_reason:
+        return foreign_reason
+
+    invoice_number = row_value(row, "invoice_number", "发票号码")
+    if is_apple_personal_receipt_number(invoice_number):
+        return "Apple 个人电子收据号，不是换开后的税务发票号码"
+    if not is_china_tax_invoice_number(invoice_number):
+        return "缺少有效中国税务发票号码"
+
+    seller = row_value(row, "seller", "收款方")
+    purchaser = row_value(row, "purchaser", "付款方")
+    seller_issue = party_quality_issue(seller)
+    if seller_issue:
+        return f"收款方{seller_issue}"
+    purchaser_issue = party_quality_issue(purchaser, allow_personal=True)
+    if purchaser_issue:
+        return f"付款方{purchaser_issue}"
+
+    if not row_value(row, "invoice_date", "开票日期"):
+        return "缺少开票日期"
+    if not amount_text(row_value(row, "effective_amount", "计入金额", "amount", "金额")):
+        return "缺少金额"
+    return ""
+
+
+def should_pool_row(row: dict[str, str]) -> bool:
+    return not pool_rejection_reason(row)
+
+
+def rejected_pool_row(row: dict[str, str], ledger_path: Path, reason: str) -> dict[str, str]:
+    return {
+        "原因": reason,
+        "状态": row_value(row, "status", "状态"),
+        "发票号码": row_value(row, "invoice_number", "发票号码"),
+        "开票日期": row_value(row, "invoice_date", "开票日期"),
+        "收款方": row_value(row, "seller", "收款方"),
+        "付款方": row_value(row, "purchaser", "付款方"),
+        "金额": amount_text(row_value(row, "effective_amount", "计入金额", "amount", "金额")),
+        "发票文件": row_value(row, "output_file", "整理后文件", "发票文件"),
+        "来源台账": str(ledger_path),
+        "邮件主题": row_value(row, "mail_subject", "邮件主题"),
+        "备注": row_value(row, "note", "备注"),
+    }
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
@@ -276,11 +413,15 @@ def sync_pool(
 ) -> list[dict[str, str]]:
     REIMBURSEMENT_ROOT.mkdir(parents=True, exist_ok=True)
     existing_by_key = {row.get("发票唯一键", ""): row for row in read_csv(pool_csv) if row.get("发票唯一键")}
-    merged_by_key: dict[str, dict[str, str]] = dict(existing_by_key)
+    merged_by_key: dict[str, dict[str, str]] = {}
+    rejected_rows: list[dict[str, str]] = []
 
     for ledger_path in ledger_csv_files(ledger_dir):
         for row in read_csv(ledger_path):
-            if not should_pool_row(row):
+            rejection_reason = pool_rejection_reason(row)
+            if rejection_reason:
+                if row_value(row, "output_file", "整理后文件", "发票文件") or row_value(row, "invoice_number", "发票号码"):
+                    rejected_rows.append(rejected_pool_row(row, ledger_path, rejection_reason))
                 continue
             raw_key = invoice_key(row)
             candidate = pool_row_from_ledger(row, ledger_path, existing_by_key.get(raw_key) or merged_by_key.get(raw_key))
@@ -297,6 +438,7 @@ def sync_pool(
     )
     write_csv(pool_csv, rows, POOL_COLUMNS)
     write_xlsx(pool_xlsx, rows, POOL_COLUMNS, "累计发票池")
+    write_csv(POOL_REJECTED_CSV, rejected_rows, REJECTION_COLUMNS)
     return rows
 
 
@@ -813,6 +955,19 @@ def issue_manifests(*, reimbursement_root: Path = REIMBURSEMENT_ROOT, limit: int
     return records
 
 
+def pool_rejection_summary(path: Path = POOL_REJECTED_CSV) -> dict[str, object]:
+    rows = read_csv(path)
+    by_reason: dict[str, int] = {}
+    for row in rows:
+        reason = str(row.get("原因") or "未说明").strip()
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+    return {
+        "pool_rejected_csv": str(path),
+        "pool_rejected_rows": len(rows),
+        "pool_rejected_by_reason": by_reason,
+    }
+
+
 def status_summary(rows: list[dict[str, str]], extra: dict[str, object] | None = None) -> dict[str, object]:
     reimbursed = [row for row in rows if is_reimbursed(row)]
     pending = [row for row in rows if not is_reimbursed(row)]
@@ -837,6 +992,7 @@ def status_summary(rows: list[dict[str, str]], extra: dict[str, object] | None =
         "latest_round": latest_round(),
         "rounds": list_rounds(),
         "missing_manifests": issue_manifests(),
+        **pool_rejection_summary(),
     }
     if extra:
         summary.update(extra)

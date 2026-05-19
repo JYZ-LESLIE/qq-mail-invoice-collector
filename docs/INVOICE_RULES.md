@@ -111,6 +111,11 @@ non-invoice downloads are marked or excluded.
 - `累计发票池` is the long-running source for reimbursement preparation.
 - Starting a new reimbursement round should exclude invoices that were already
   marked reimbursed in historical batches.
+- The pool is stricter than raw ledgers: overseas receipts, foreign-currency
+  invoices, Apple personal receipt numbers such as `MC...`, blank purchaser /
+  seller rows, and rows without a valid Chinese tax invoice number are excluded.
+- Excluded candidates are written to `累计池不入池清单.csv` with a readable reason
+  instead of silently entering the reimbursement folder.
 - `prepare-files --scope pending` prepares a folder containing the current
   pending invoice files, so the Excel summary and the actual PDFs can be checked
   together.

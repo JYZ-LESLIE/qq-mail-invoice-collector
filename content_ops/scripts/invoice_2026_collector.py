@@ -194,6 +194,22 @@ NON_INVOICE_DOCUMENT_MARKERS = (
     "quote number",
     "proforma invoice",
 )
+FOREIGN_RECEIPT_MARKERS = (
+    "auckland",
+    "new zealand",
+    "united states",
+    "usd",
+    "eur",
+    "gbp",
+    "nzd",
+    " aud",
+    "cad",
+    "seats.aero",
+    "intercontinental auckland",
+    "your receipt",
+    "receipt from",
+    "amount due",
+)
 DEFERRED_PLATFORM_MARKERS = (
     "icloud+",
     "icloud-efapiao.gzdata.com.cn",
@@ -631,7 +647,32 @@ def output_is_pdf(row: dict[str, str]) -> bool:
     return Path(output_file).suffix.lower() == ".pdf"
 
 
+def is_foreign_receipt_row(row: dict[str, str]) -> bool:
+    combined = " ".join(
+        str(row.get(key) or "")
+        for key in (
+            "mail_subject",
+            "mail_from",
+            "seller",
+            "purchaser",
+            "attachment_original_name",
+            "original_file",
+            "output_file",
+            "links",
+            "note",
+            "link_platform",
+        )
+    ).lower()
+    if any(marker in combined for marker in FOREIGN_RECEIPT_MARKERS):
+        return True
+    if "$" in combined and not any(marker in combined for marker in ("增值税", "数电", "电子发票")):
+        return True
+    return False
+
+
 def looks_like_china_invoice_row(row: dict[str, str]) -> bool:
+    if is_foreign_receipt_row(row):
+        return False
     combined = " ".join(
         str(row.get(key) or "")
         for key in (
@@ -648,7 +689,12 @@ def looks_like_china_invoice_row(row: dict[str, str]) -> bool:
     )
     markers = ("增值税", "电子发票", "数电", "普通发票", "专用发票", "发票号码", "开票日期")
     has_tax_marker = any(marker in combined for marker in markers)
-    invoice_number = re.sub(r"\D", "", str(row.get("invoice_number") or ""))
+    raw_invoice_number = str(row.get("invoice_number") or "").strip()
+    if re.fullmatch(r"MC\d{6,}", raw_invoice_number, flags=re.IGNORECASE):
+        return False
+    if raw_invoice_number and not re.fullmatch(r"\d{8,24}", raw_invoice_number):
+        return False
+    invoice_number = re.sub(r"\D", "", raw_invoice_number)
     has_cn_name = bool(re.search(r"[\u4e00-\u9fff]{2,}", f"{row.get('seller', '')}{row.get('purchaser', '')}"))
     if invoice_number and len(invoice_number) >= 8 and (has_cn_name or has_tax_marker):
         return True
