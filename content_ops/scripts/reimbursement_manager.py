@@ -32,6 +32,7 @@ POOL_REJECTED_CSV = REIMBURSEMENT_ROOT / "累计池不入池清单.csv"
 VALID_STATUSES = {"Parsed", "AI_Verified", "已解析", "AI复核"}
 UNREIMBURSED = "未报销"
 IN_ROUND = "已入批次待提交"
+CURRENT_YEAR = dt.date.today().year
 
 POOL_COLUMNS = [
     "发票唯一键",
@@ -162,6 +163,13 @@ def row_text(row: dict[str, str], *extra_values: object) -> str:
     values = list(extra_values)
     values.extend(row.get(key, "") for key in row.keys())
     return " ".join(str(value or "") for value in values)
+
+
+def invoice_year(value: object) -> int | None:
+    match = re.search(r"(20\d{2})", str(value or ""))
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 def foreign_receipt_reason(row: dict[str, str]) -> str:
@@ -312,8 +320,12 @@ def pool_rejection_reason(row: dict[str, str]) -> str:
     if purchaser_issue:
         return f"付款方{purchaser_issue}"
 
-    if not row_value(row, "invoice_date", "开票日期"):
+    invoice_date = row_value(row, "invoice_date", "开票日期")
+    if not invoice_date:
         return "缺少开票日期"
+    year = invoice_year(invoice_date)
+    if year and year != CURRENT_YEAR:
+        return "非本年度发票，不能进入本轮报销"
     if not amount_text(row_value(row, "effective_amount", "计入金额", "amount", "金额")):
         return "缺少金额"
     return ""
@@ -968,6 +980,87 @@ def pool_rejection_summary(path: Path = POOL_REJECTED_CSV) -> dict[str, object]:
     }
 
 
+def manifest_file_issues(manifest_path: Path, *, expected_rows: int | None = None) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    rows = read_csv(manifest_path)
+    if expected_rows is not None and len(rows) != expected_rows:
+        issues.append({"类型": "清单数量不一致", "说明": f"清单 {len(rows)} 条，应为 {expected_rows} 条", "文件": str(manifest_path)})
+    seen_paths: set[str] = set()
+    for index, row in enumerate(rows, start=2):
+        file_text = str(row.get("发票文件") or "").strip()
+        if not file_text:
+            issues.append({"类型": "清单缺少发票文件路径", "说明": f"第 {index} 行没有发票文件路径", "文件": str(manifest_path)})
+            continue
+        file_path = Path(file_text).expanduser()
+        if not file_path.is_absolute():
+            file_path = (WORKSPACE_ROOT / file_path).resolve()
+        resolved = str(file_path)
+        if resolved in seen_paths:
+            issues.append({"类型": "清单重复文件", "说明": f"第 {index} 行重复指向同一个发票文件", "文件": resolved})
+        seen_paths.add(resolved)
+        if not file_path.exists():
+            issues.append({"类型": "清单文件不存在", "说明": f"第 {index} 行指向的发票文件不存在", "文件": resolved})
+    return issues
+
+
+def audit_pool_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    for index, row in enumerate(rows, start=2):
+        reason = pool_rejection_reason(row)
+        if reason:
+            issues.append(
+                {
+                    "类型": "累计池记录不合格",
+                    "说明": reason,
+                    "行号": str(index),
+                    "发票号码": row.get("发票号码", ""),
+                    "发票文件": row.get("发票文件", ""),
+                }
+            )
+    for group_index, group in enumerate(duplicate_source_groups(rows), start=1):
+        for row in group:
+            issues.append(
+                {
+                    "类型": "同一发票文件对应多条记录",
+                    "说明": f"重复组 {group_index}",
+                    "发票号码": row.get("发票号码", ""),
+                    "发票文件": row.get("发票文件", ""),
+                }
+            )
+    for row in missing_invoice_files(rows):
+        issues.append(
+            {
+                "类型": "累计池发票文件缺失",
+                "说明": row.get("收款方", ""),
+                "发票号码": row.get("发票号码", ""),
+                "发票文件": row.get("发票文件", ""),
+            }
+        )
+    return issues
+
+
+def audit_summary(rows: list[dict[str, str]]) -> dict[str, object]:
+    pending = [row for row in rows if not is_reimbursed(row)]
+    issues = audit_pool_rows(rows)
+    pending_manifest = POOL_FILES_DIR / "本轮待报销发票" / "发票文件清单.csv"
+    all_manifest = POOL_FILES_DIR / "全部累计发票" / "发票文件清单.csv"
+    if pending_manifest.exists():
+        issues.extend(manifest_file_issues(pending_manifest, expected_rows=len(pending)))
+    if all_manifest.exists():
+        issues.extend(manifest_file_issues(all_manifest, expected_rows=len(rows)))
+    by_type: dict[str, int] = {}
+    for issue in issues:
+        issue_type = issue.get("类型", "未分类")
+        by_type[issue_type] = by_type.get(issue_type, 0) + 1
+    return {
+        **status_summary(rows),
+        "status": "audit_passed" if not issues else "audit_failed",
+        "audit_issues": len(issues),
+        "audit_issues_by_type": by_type,
+        "audit_issue_examples": issues[:20],
+    }
+
+
 def status_summary(rows: list[dict[str, str]], extra: dict[str, object] | None = None) -> dict[str, object]:
     reimbursed = [row for row in rows if is_reimbursed(row)]
     pending = [row for row in rows if not is_reimbursed(row)]
@@ -1003,6 +1096,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Manage reimbursement rounds from local invoice ledgers.")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("status")
+    subparsers.add_parser("audit")
     subparsers.add_parser("refresh")
     files_parser = subparsers.add_parser("prepare-files")
     files_parser.add_argument("--scope", choices=["pending", "all"], default="pending")
@@ -1012,6 +1106,8 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     if args.command == "status":
         summary = status_summary(read_csv(POOL_CSV))
+    elif args.command == "audit":
+        summary = audit_summary(read_csv(POOL_CSV))
     elif args.command == "refresh":
         rows = sync_pool()
         summary = status_summary(rows)
@@ -1024,7 +1120,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     print(f"REIMBURSEMENT_SUMMARY_JSON={json.dumps(summary, ensure_ascii=False)}")
-    return 0
+    return 2 if summary.get("status") == "audit_failed" else 0
 
 
 if __name__ == "__main__":
