@@ -68,11 +68,15 @@ THREAD_LOCAL = threading.local()
 SUBJECT_KEYWORDS = (
     "发票",
     "电子发票",
+    "发票下载",
+    "下载发票",
     "开票",
     "开票成功",
+    "开具成功",
     "电票",
     "数电票",
     "Invoice",
+    "Tax Invoice",
     "账单",
     "行程单",
     "滴滴",
@@ -90,6 +94,21 @@ SUBJECT_KEYWORDS = (
     "飞书订阅",
     "火山引擎",
     "Volcengine",
+)
+
+BODY_RECALL_KEYWORDS = (
+    "发票",
+    "电子发票",
+    "发票下载",
+    "下载发票",
+    "开票",
+    "开票成功",
+    "开具成功",
+    "点击下载",
+    "Invoice",
+    "Tax Invoice",
+    "download invoice",
+    "view invoice",
 )
 
 PRIORITY_SENDER_DOMAINS = (
@@ -127,11 +146,14 @@ PRIORITY_SENDER_DOMAINS = (
 LIKELY_INVOICE_KEYWORDS = (
     "发票",
     "电子发票",
+    "发票下载",
+    "下载发票",
     "数电票",
     "全电票",
     "开票",
     "开票成功",
     "开票申请",
+    "开具成功",
     "电票",
     "数电票",
     "票据",
@@ -148,6 +170,9 @@ LIKELY_INVOICE_KEYWORDS = (
     "t3出行",
     "首汽约车",
     "invoice",
+    "tax invoice",
+    "download invoice",
+    "view invoice",
     "receipt",
     "tax",
     "飞书",
@@ -554,6 +579,11 @@ def looks_invoice_related(*texts: str) -> bool:
 def subject_has_invoice_keyword(subject: str) -> bool:
     subject_lower = (subject or "").lower()
     return any(keyword.lower() in subject_lower for keyword in SUBJECT_KEYWORDS)
+
+
+def body_has_invoice_keyword(*texts: str) -> bool:
+    combined = " ".join(t or "" for t in texts).lower()
+    return any(keyword.lower() in combined for keyword in BODY_RECALL_KEYWORDS)
 
 
 def invoice_hints_from_subject(subject: str) -> dict[str, str]:
@@ -2361,7 +2391,13 @@ class ProcessLog:
         ).fetchone()
         if row is None:
             return False
-        return str(row[0] or "") not in {"failed", "fetch_failed", "timeout", "imap_timeout"}
+        return str(row[0] or "") not in {
+            "failed",
+            "fetch_failed",
+            "timeout",
+            "imap_timeout",
+            "skipped_subject_filter",
+        }
 
     def mark(self, mailbox: str, uid: bytes | str, status: str, records_count: int = 0, error: str = "") -> None:
         uid_text = uid.decode("ascii", errors="replace") if isinstance(uid, bytes) else str(uid)
@@ -2482,6 +2518,33 @@ def search_attachment_candidate_uids(
     return result
 
 
+def search_body_candidate_uids(
+    mail: imaplib.IMAP4_SSL,
+    *,
+    since_atom: str,
+    before_atom: str,
+    retry_attempts: int,
+    retry_sleep: float,
+) -> set[bytes]:
+    result: set[bytes] = set()
+    for keyword in BODY_RECALL_KEYWORDS:
+        use_utf8 = any(ord(char) > 127 for char in keyword)
+        try:
+            result.update(
+                uid_search(
+                    mail,
+                    f"(SINCE {since_atom} BEFORE {before_atom} BODY {imap_quote(keyword)})",
+                    retry_attempts=retry_attempts,
+                    retry_sleep=retry_sleep,
+                    label=f"IMAP body search {keyword}",
+                    use_utf8=use_utf8,
+                )
+            )
+        except Exception as exc:
+            print(f"Sample Calibration filter warning: body keyword '{keyword}' skipped by IMAP server: {exc}")
+    return result
+
+
 def search_invoice_candidate_uids(
     mail: imaplib.IMAP4_SSL,
     *,
@@ -2491,6 +2554,7 @@ def search_invoice_candidate_uids(
     retry_sleep: float,
     limit: int | None,
     enable_attachment_probe: bool = True,
+    enable_body_search: bool = True,
     max_attachment_probe: int = MAX_ATTACHMENT_PROBE_UIDS,
     search_mode: str = "filtered",
 ) -> list[bytes]:
@@ -2514,6 +2578,7 @@ def search_invoice_candidate_uids(
         return ordered
 
     subject_uids: set[bytes] = set()
+    body_uids: set[bytes] = set()
     priority_uids: set[bytes] = set()
 
     for keyword in SUBJECT_KEYWORDS:
@@ -2531,6 +2596,15 @@ def search_invoice_candidate_uids(
             )
         except Exception as exc:
             print(f"Sample Calibration filter warning: subject keyword '{keyword}' skipped by IMAP server: {exc}")
+
+    if enable_body_search:
+        body_uids = search_body_candidate_uids(
+            mail,
+            since_atom=since_atom,
+            before_atom=before_atom,
+            retry_attempts=retry_attempts,
+            retry_sleep=retry_sleep,
+        )
 
     for domain in PRIORITY_SENDER_DOMAINS:
         try:
@@ -2559,7 +2633,8 @@ def search_invoice_candidate_uids(
     )
 
     priority_date_uids = date_uids & priority_uids
-    candidate_uids = (date_uids & subject_uids) | priority_date_uids | attachment_uids
+    body_date_uids = date_uids & body_uids
+    candidate_uids = (date_uids & subject_uids) | body_date_uids | priority_date_uids | attachment_uids
     priority_sorted = sorted(candidate_uids & priority_uids, key=uid_sort_key)
     other_sorted = sorted(candidate_uids - priority_uids, key=uid_sort_key)
     ordered = sorted(candidate_uids, key=uid_sort_key, reverse=True)
@@ -2572,6 +2647,7 @@ def search_invoice_candidate_uids(
     print(
         "Sample Calibration IMAP filter: "
         f"date_matches={len(date_uids)}, subject_matches={len(subject_uids)}, "
+        f"body_matches={len(body_uids)}, body_date_matches={len(body_date_uids)}, "
         f"attachment_matches={len(attachment_uids)}, priority_sender_matches={len(priority_uids)}, "
         f"priority_date_matches={len(priority_date_uids)}, "
         f"candidates={len(candidate_uids)}"
@@ -3051,9 +3127,6 @@ def process_message_uid(
         sender = decode_mime_words(header_msg.get("From"))
         sent_at = parse_date(header_msg.get("Date"))
         received_at = parse_internal_date(header_data[0][0], sent_at)
-        subject_related = subject_has_invoice_keyword(subject)
-        if not (subject_related or looks_invoice_related(subject, sender) or sender_is_priority(sender)):
-            return message_uid, "skipped_subject_filter", message_rows, ""
 
         typ, fetched = retry_call(
             lambda uid=message_uid: mail.uid("fetch", uid, "(RFC822 INTERNALDATE)"),
@@ -3073,7 +3146,8 @@ def process_message_uid(
         plain, html_text = get_text_parts(msg)
         body_text = f"{plain}\n{re.sub(r'<[^>]+>', ' ', html_text or '')}"
         attachment_related = message_has_invoice_attachment(msg)
-        related = subject_related or attachment_related or looks_invoice_related(subject, sender, plain, html_text)
+        body_related = body_has_invoice_keyword(plain, html_text)
+        related = subject_related or body_related or attachment_related or looks_invoice_related(subject, sender, plain, html_text)
         if not related:
             return message_uid, "skipped_subject_filter", message_rows, ""
 
@@ -3296,6 +3370,7 @@ def scan_mailbox(
             retry_sleep=retry_sleep,
             limit=limit,
             enable_attachment_probe=str(env.get("ENABLE_ATTACHMENT_PROBE", "1")).lower() not in {"0", "false", "no", "off"},
+            enable_body_search=str(env.get("ENABLE_BODY_SEARCH", "1")).lower() not in {"0", "false", "no", "off"},
             max_attachment_probe=int(env.get("MAX_ATTACHMENT_PROBE_UIDS", str(MAX_ATTACHMENT_PROBE_UIDS))),
             search_mode=str(env.get("INVOICE_SEARCH_MODE", "filtered")),
         )

@@ -2,8 +2,8 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-private let appVersion = "0.1.10"
-private let appBuild = "20260520.6"
+private let appVersion = "0.1.11"
+private let appBuild = "20260520.7"
 private let appEdition = "带图标数据安全版"
 private let workspaceRoot = Bundle.main.bundleURL.deletingLastPathComponent()
 private let invoiceRoot = workspaceRoot.appendingPathComponent("发票整理")
@@ -695,6 +695,50 @@ final class InvoiceAppModel: ObservableObject {
         } catch {
             fputs("读取邮箱账号配置失败：\(error.localizedDescription)\n", stderr)
             return 1
+        }
+    }
+
+    static func runOnceCommand(arguments: [String]) -> Int32 {
+        var runnerArguments = [
+            runnerURL.path,
+            "--accounts", accountsURL.path,
+        ]
+        if let since = optionValue("--since", in: arguments), !since.isEmpty {
+            runnerArguments.append(contentsOf: ["--since", since])
+        }
+        if let until = optionValue("--until", in: arguments), !until.isEmpty {
+            runnerArguments.append(contentsOf: ["--until", until])
+        }
+        for accountID in optionValues("--account", in: arguments) where !accountID.isEmpty {
+            runnerArguments.append(contentsOf: ["--account", accountID])
+        }
+        if let limit = optionValue("--limit", in: arguments), !limit.isEmpty {
+            runnerArguments.append(contentsOf: ["--limit", limit])
+        }
+        if arguments.contains("--reprocess") {
+            runnerArguments.append("--reprocess")
+        }
+
+        let result = runProcessSync(arguments: runnerArguments)
+        if !result.output.isEmpty {
+            print(result.output, terminator: result.output.hasSuffix("\n") ? "" : "\n")
+        }
+        if !result.error.isEmpty, let data = result.error.data(using: .utf8) {
+            FileHandle.standardError.write(data)
+        }
+        return result.exitCode
+    }
+
+    private static func optionValue(_ name: String, in arguments: [String]) -> String? {
+        guard let index = arguments.firstIndex(of: name), index + 1 < arguments.count else {
+            return nil
+        }
+        return arguments[index + 1]
+    }
+
+    private static func optionValues(_ name: String, in arguments: [String]) -> [String] {
+        arguments.indices.compactMap { index in
+            arguments[index] == name && index + 1 < arguments.count ? arguments[index + 1] : nil
         }
     }
 
@@ -2884,6 +2928,9 @@ struct InvoicePilotApp: App {
         if arguments.contains("--demo-smoke-test") {
             print("INVOICE_APP_SMOKE_TEST=completed")
             exit(0)
+        }
+        if arguments.contains("--run-once") {
+            exit(InvoiceAppModel.runOnceCommand(arguments: arguments))
         }
         if arguments.contains("--list-accounts") {
             exit(InvoiceAppModel.runAccountListCommand())
