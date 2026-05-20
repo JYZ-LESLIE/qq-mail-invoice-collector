@@ -18,6 +18,14 @@ from urllib.error import HTTPError, URLError
 
 
 URL_RE = re.compile(r"https?://[^\s\"'<>）)]+", re.IGNORECASE)
+PARTY_LABEL_MARKERS = (
+    "差额征税",
+    "差额开票",
+    "购买方信息",
+    "销售方信息",
+    "统一社会信用代码",
+    "纳税人识别号",
+)
 
 
 def parse_invoice_pdf_stream(
@@ -75,7 +83,7 @@ def parse_invoice_pdf_stream(
         if image_data_urls:
             prompt = invoice_extraction_prompt(raw_text)
             ai_fields = normalize_ai_fields(vision_extract(image_data_urls, prompt) or {})
-            merged = {**fields, **{k: v for k, v in ai_fields.items() if v}}
+            merged = merge_text_and_vision_fields(fields, ai_fields)
             result.update(merged)
             result.update(
                 status="parsed" if has_minimum_invoice_fields(merged) else "need_review",
@@ -143,7 +151,7 @@ def parse_invoice_pdf_pages(
                     result.update(status="non_invoice_document", engine="pdf_text", error="non_invoice_document")
                     pages.append(result)
                     continue
-                if has_minimum_invoice_fields(fields):
+                if has_minimum_invoice_fields(fields) and not should_use_vision_for_ambiguous_fields(fields):
                     result.update(fields)
                     result.update(status="parsed", engine="pdf_text")
                     pages.append(result)
@@ -154,7 +162,7 @@ def parse_invoice_pdf_pages(
                     if data_url:
                         prompt = invoice_extraction_prompt(raw_text)
                         ai_fields = normalize_ai_fields(vision_extract([data_url], prompt) or {})
-                        merged = {**fields, **{k: v for k, v in ai_fields.items() if v}}
+                        merged = merge_text_and_vision_fields(fields, ai_fields)
                         result.update(merged)
                         result.update(
                             status="parsed" if has_minimum_invoice_fields(merged) else "need_review",
@@ -480,6 +488,15 @@ def extract_invoice_date(compact_text: str, lines: list[str]) -> str:
 
 
 def extract_china_invoice_total(text: str) -> str:
+    for line in (text or "").splitlines():
+        if "小写" not in line:
+            continue
+        before_label = re.search(r"(-?[0-9,]+\.[0-9]{2})\s*[（(]\s*小写\s*[）)]?", line)
+        if before_label:
+            return f"{float(before_label.group(1).replace(',', '')):.2f}"
+        after_label = re.search(r"[（(]?\s*小写\s*[）)]?\s*[¥￥]?\s*(-?[0-9,]+\.[0-9]{2})", line)
+        if after_label:
+            return f"{float(after_label.group(1).replace(',', '')):.2f}"
     compact = re.sub(r"\s+", "", text or "")
     small_total = re.search(r"[（(]?小写[）)]?[¥￥]\s*(-?[0-9,]+\.[0-9]{2})", compact)
     if small_total:
@@ -505,6 +522,8 @@ def extract_china_invoice_parties(lines: list[str]) -> dict[str, str]:
         "名称：",
         "名称:",
         "名称",
+        "备",
+        "注",
         "购买方信息",
         "销售方信息",
         "统一社会信用代码/纳税人识别号：",
@@ -515,7 +534,12 @@ def extract_china_invoice_parties(lines: list[str]) -> dict[str, str]:
         clean = value.strip()
         if not clean or clean in ignored_tokens:
             return False
-        if any(token in clean for token in ("发票号码", "开票日期", "开票人", "项目名称", "规格型号", "税率", "税额", "价税合计", "合计")):
+        compact_clean = re.sub(r"\s+", "", clean)
+        if len(compact_clean) < 2:
+            return False
+        if any(marker in clean or marker in compact_clean for marker in PARTY_LABEL_MARKERS):
+            return False
+        if any(token in clean for token in ("发票号码", "开票日期", "开票人", "项目名称", "规格型号", "税率", "税额", "价税合计", "合计", "小写", "大写", "备注")):
             return False
         if re.fullmatch(r"20\d{2}年\d{1,2}月\d{1,2}日", clean) or re.fullmatch(r"20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}", clean):
             return False
@@ -594,12 +618,32 @@ def should_use_vision_for_ambiguous_fields(fields: dict[str, str]) -> bool:
         return True
     if seller and purchaser and seller == purchaser:
         return True
+    if len(re.sub(r"\s+", "", seller)) < 2 or len(re.sub(r"\s+", "", purchaser)) < 2:
+        return True
     suspicious_tokens = ("开票日期", "开票人", "项目名称", "价税合计", "税率", "税额")
     if any(token in seller or token in purchaser for token in suspicious_tokens):
+        return True
+    if any(token in seller or token in purchaser for token in PARTY_LABEL_MARKERS):
         return True
     if re.fullmatch(r"20\d{2}年\d{1,2}月\d{1,2}日", seller) or re.fullmatch(r"20\d{2}年\d{1,2}月\d{1,2}日", purchaser):
         return True
     return False
+
+
+def merge_text_and_vision_fields(text_fields: dict[str, str], ai_fields: dict[str, str]) -> dict[str, str]:
+    merged = dict(text_fields)
+    text_preferred = {"invoice_number", "invoice_code", "invoice_date", "amount"}
+    for key, value in ai_fields.items():
+        if not value:
+            continue
+        if key in text_preferred and text_fields.get(key):
+            if key == "amount" and str(text_fields.get(key) or "").strip() != str(value or "").strip():
+                existing_note = str(merged.get("note") or "")
+                warning = f"视觉金额与文本金额不一致: 文本={text_fields.get(key)}, 视觉={value}"
+                merged["note"] = "; ".join(part for part in (existing_note, warning) if part)
+            continue
+        merged[key] = value
+    return merged
 
 
 def normalize_ai_fields(fields: dict[str, object]) -> dict[str, str]:
@@ -969,6 +1013,7 @@ def build_mimo_qr_url_extractor(env: dict[str, str]) -> Callable[[list[str]], st
 
 
 def _clean_name(value: str) -> str:
+    value = re.sub(r"^(?:名称|购买方名称|销售方名称)\s*[:：]\s*", "", value.strip())
     value = re.sub(r"[\\/:*?\"<>|\r\n\t]+", "_", value)
     value = re.sub(r"\s+", "", value)
     return value.strip(" .")[:160]

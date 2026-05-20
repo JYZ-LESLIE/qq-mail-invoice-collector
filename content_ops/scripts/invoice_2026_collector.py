@@ -739,6 +739,21 @@ def extract_red_blue_invoice_number_from_text(*values: object) -> str:
     return match.group(1) if match else ""
 
 
+def row_has_suspicious_invoice_fields(row: dict[str, str]) -> bool:
+    seller = str(row.get("seller") or "").strip()
+    purchaser = str(row.get("purchaser") or "").strip()
+    party_text = f"{seller} {purchaser}"
+    if re.search(r"(^|\s)(销|购|名称)($|\s)", party_text) or "名称_" in party_text:
+        return True
+    if any(token in party_text for token in ("差额征税", "差额开票", "购买方信息", "销售方信息", "价税合计")):
+        return True
+    if seller and len(re.sub(r"\s+", "", seller)) < 2:
+        return True
+    if purchaser and len(re.sub(r"\s+", "", purchaser)) < 2:
+        return True
+    return False
+
+
 def enrich_row_from_pdf(row: dict[str, str]) -> dict[str, str]:
     path_text = str(row.get("output_file") or row.get("original_file") or "")
     if not path_text:
@@ -746,10 +761,12 @@ def enrich_row_from_pdf(row: dict[str, str]) -> dict[str, str]:
     path = Path(path_text)
     if path.suffix.lower() != ".pdf" or not path.exists():
         return row
+    repair_suspicious = row_has_suspicious_invoice_fields(row)
     needs_pdf_probe = (
         not row.get("order_number")
         or not row.get("related_invoice_number")
         or str(row.get("status") or "") not in {"Parsed", "AI_Verified"}
+        or repair_suspicious
     )
     if not needs_pdf_probe:
         return row
@@ -777,13 +794,16 @@ def enrich_row_from_pdf(row: dict[str, str]) -> dict[str, str]:
         )
     }
     for key, value in fields.items():
-        if value and not row.get(key):
+        if value and (repair_suspicious or not row.get(key)):
             row[key] = value
     if row.get("status") not in {"Parsed", "AI_Verified"} and has_minimum_invoice_fields(fields):
         row["status"] = "Parsed"
         row["parse_status"] = str(parsed.get("status") or "parsed")
         row["parse_engine"] = str(parsed.get("engine") or "pdf_text_repair")
         append_note_once(row, "auto_repaired_from_pdf_text")
+    elif repair_suspicious and has_minimum_invoice_fields(fields):
+        row["parse_engine"] = "pdf_text_layout_repair"
+        append_note_once(row, "auto_repaired_suspicious_pdf_layout")
     return row
 
 
@@ -826,13 +846,17 @@ def annotate_invoice_relationships(rows: list[dict[str, str]]) -> list[dict[str,
     annotated = [dict(row) for row in rows]
     for row in annotated:
         relation_defaults(row)
-        if is_apple_hardware_invoice_row(row) or "联通" in str(row.get("seller") or row.get("mail_subject") or ""):
+        if row_has_suspicious_invoice_fields(row) or is_apple_hardware_invoice_row(row) or "联通" in str(row.get("seller") or row.get("mail_subject") or ""):
             enrich_row_from_pdf(row)
         if not row.get("order_number"):
             row["order_number"] = extract_order_number_from_text(row.get("mail_subject"), row.get("links"), row.get("attachment_original_name"), row.get("note"))
         if not row.get("related_invoice_number"):
             row["related_invoice_number"] = extract_red_blue_invoice_number_from_text(row.get("note"), row.get("links"), row.get("mail_subject"))
         amount = amount_to_float(row.get("amount"))
+        if row.get("relation_type") == "红字冲销" and amount is not None and amount > 0:
+            amount = -amount
+            row["amount"] = f"{amount:.2f}"
+            append_note_once(row, "红字发票金额按负数入账")
         if amount is not None:
             row["effective_amount"] = f"{amount:.2f}"
         if amount is not None and amount < 0:
@@ -885,12 +909,24 @@ def dedupe_invoice_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
 
     def row_score(row: dict[str, str]) -> int:
         score = 0
-        if output_is_pdf(row):
-            score += 20
+        parse_engine = str(row.get("parse_engine") or "").strip()
+        output_file = str(row.get("output_file") or "").lower()
+        if parse_engine in {"xml_structured", "ofd_structured"} or output_file.endswith((".xml", ".ofd")):
+            score += 45
+        elif output_is_pdf(row):
+            score += 8
         if row.get("invoice_number"):
             score += 10
         if row.get("seller"):
             score += 5
+        amount_value = amount_to_float(row.get("amount"))
+        if amount_value is not None and amount_value < 0:
+            score += 60
+        if row.get("relation_type") == "红字冲销":
+            score += 20
+        party_text = f"{row.get('seller') or ''} {row.get('purchaser') or ''}"
+        if re.search(r"(^|\s)(销|购)($|\s)", party_text) or "名称_" in party_text:
+            score -= 30
         if row.get("status") == "Parsed":
             score += 3
         if row.get("status") == "AI_Verified":
@@ -1627,6 +1663,43 @@ def decode_invoice_text(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def parse_signed_amount_text(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    normalized = text.replace("−", "-").replace("－", "-").replace("﹣", "-")
+    match = re.search(r"([+-])?\s*[¥￥]?\s*([+-])?\s*([0-9,]+(?:\.[0-9]{1,2})?)", normalized)
+    if not match:
+        return ""
+    sign = match.group(1) or match.group(2) or ""
+    amount = float(match.group(3).replace(",", ""))
+    has_parenthesized_amount = bool(re.search(r"[（(]\s*[¥￥]?\s*[0-9,]+(?:\.[0-9]{1,2})?\s*[）)]", normalized))
+    if sign == "-" or "负" in normalized or has_parenthesized_amount:
+        amount = -abs(amount)
+    return f"{amount:.2f}"
+
+
+def structured_invoice_is_red(root: ET.Element, text: str) -> bool:
+    red_markers = ("红字发票", "红字信息", "被红冲蓝字", "红冲", "负数发票")
+    if any(marker in text for marker in red_markers):
+        return True
+    red_flag_names = {
+        "isred",
+        "redflag",
+        "redmark",
+        "redletterflag",
+        "redinvoiceflag",
+        "redinvoicemark",
+    }
+    truthy_values = {"1", "true", "yes", "y", "是", "红字", "红票", "red"}
+    for elem in root.iter():
+        name = xml_local_name(elem.tag).lower()
+        value = str(elem.text or "").strip().lower()
+        if name in red_flag_names and value in truthy_values:
+            return True
+    return False
+
+
 def normalize_structured_invoice_kind(value: str) -> str:
     text = str(value or "")
     if "专用" in text:
@@ -1667,18 +1740,24 @@ def parse_invoice_xml_bytes(data: bytes) -> tuple[dict[str, str], str]:
     fields["purchaser"] = first_xml_text(root, "BuyerName", "PurchaserName", "Gmfmc")
     amount = first_xml_text(root, "TotalTax-includedAmount", "TotalTaxIncludedAmount", "TotalAmount", "Jshj")
     if amount:
-        amount_match = re.search(r"([0-9,]+(?:\.[0-9]{1,2})?)", amount)
-        if amount_match:
-            fields["amount"] = f"{float(amount_match.group(1).replace(',', '')):.2f}"
+        parsed_amount = parse_signed_amount_text(amount)
+        if parsed_amount:
+            fields["amount"] = parsed_amount
     general_type = nested_xml_text(root, "GeneralOrSpecialVAT", "LabelName")
     invoice_type = nested_xml_text(root, "EInvoiceType", "LabelName")
     fields["invoice_kind"] = normalize_structured_invoice_kind(general_type or invoice_type)
     item_name = first_xml_text(root, "ItemName", "GoodsName", "Xmmc")
     fields["category"] = categorize_structured_invoice(fields.get("seller", ""), item_name)
+    if structured_invoice_is_red(root, text):
+        fields["relation_type"] = "红字冲销"
 
     fallback = parse_invoice_fields_from_text(text)
     for key, value in fallback.items():
         fields.setdefault(key, value)
+    if fields.get("relation_type") == "红字冲销":
+        amount_value = amount_to_float(fields.get("amount"))
+        if amount_value is not None and amount_value > 0:
+            fields["amount"] = f"{-amount_value:.2f}"
     return {key: value for key, value in fields.items() if value}, text
 
 
@@ -2474,9 +2553,16 @@ def search_invoice_candidate_uids(
     return ordered
 
 
-def write_invoice_output(path: Path, fields: dict[str, str], payload: bytes | None = None, page_number: int | None = None) -> tuple[Path, str]:
+def write_invoice_output(
+    path: Path,
+    fields: dict[str, str],
+    payload: bytes | None = None,
+    page_number: int | None = None,
+    *,
+    force_review: bool = False,
+) -> tuple[Path, str]:
     required = ("invoice_date", "seller", "amount")
-    if any(not fields.get(key) for key in required):
+    if force_review or any(not fields.get(key) for key in required):
         target_dir = MANUAL_DIR
         status = "Need_Review"
     else:
@@ -2631,12 +2717,21 @@ def rows_for_saved_artifact(
                         fields,
                         payload=page_payload,
                         page_number=page_number if page_count > 1 else None,
+                        force_review=parse_status != "parsed",
                     )
                     if parse_engine == "vision_fallback" and parse_status == "parsed":
                         status = "AI_Verified"
             discovered_page_links = list(discovered_links)
             discovered_page_links.extend(str(link) for link in parsed.get("links", []) if link)
-            note = str(parsed.get("error") or parsed.get("model_error") or link_note or "")
+            note = "; ".join(
+                part
+                for part in (
+                    str(fields.get("note") or ""),
+                    str(parsed.get("error") or parsed.get("model_error") or ""),
+                    link_note,
+                )
+                if part
+            )
             rows.append(
                 {
                     "status": status,
@@ -2703,8 +2798,8 @@ def rows_for_saved_artifact(
         parse_status = str(parsed.get("status", "need_review"))
         parse_engine = str(parsed.get("engine", f"{saved.suffix.lower().lstrip('.')}_structured"))
         with OUTPUT_LOCK:
-            output_path, status = write_invoice_output(saved, fields)
-        note = str(parsed.get("error") or link_note or "")
+            output_path, status = write_invoice_output(saved, fields, force_review=parse_status != "parsed")
+        note = "; ".join(part for part in (str(fields.get("note") or ""), str(parsed.get("error") or ""), link_note) if part)
         rows.append(
             {
                 "status": status,

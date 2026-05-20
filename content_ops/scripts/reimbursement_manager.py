@@ -33,6 +33,7 @@ VALID_STATUSES = {"Parsed", "AI_Verified", "已解析", "AI复核"}
 UNREIMBURSED = "未报销"
 IN_ROUND = "已入批次待提交"
 CURRENT_YEAR = dt.date.today().year
+GENERATED_MANIFESTS = {"发票文件清单.csv", "缺失文件清单.csv"}
 
 POOL_COLUMNS = [
     "发票唯一键",
@@ -453,6 +454,20 @@ def rejected_pool_row(row: dict[str, str], ledger_path: Path, reason: str) -> di
     }
 
 
+def should_write_rejected_pool_row(row: dict[str, str], ledger_path: Path, reason: str) -> bool:
+    output_file = row_value(row, "output_file", "整理后文件", "发票文件")
+    invoice_number = row_value(row, "invoice_number", "发票号码")
+    if ledger_path.name.startswith("发票台账_"):
+        return bool(output_file or invoice_number)
+    if reason == "未解析成功，保留在人工复核/线索区" and not invoice_number:
+        if output_file:
+            output_path = Path(output_file).expanduser()
+            if output_path.suffix.lower() in {".pdf", ".ofd", ".xml"} and output_path.exists():
+                return True
+        return False
+    return bool(output_file or invoice_number)
+
+
 def read_csv(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         return []
@@ -487,10 +502,13 @@ def ledger_csv_files(ledger_dir: Path) -> list[Path]:
         match = re.search(r"(\d{8}_\d{6})", path.name)
         return match.group(1) if match else ""
 
-    return sorted(
-        [path for path in ledger_dir.glob("发票台账_*.csv") if not path.name.startswith("~$")],
-        key=ledger_timestamp,
-    )
+    candidates = [
+        path
+        for pattern in ("invoice_manifest_*.csv", "发票台账_*.csv")
+        for path in ledger_dir.glob(pattern)
+        if not path.name.startswith("~$")
+    ]
+    return sorted(dict.fromkeys(candidates), key=ledger_timestamp)
 
 
 def pool_row_from_ledger(row: dict[str, str], ledger_path: Path, existing: dict[str, str] | None) -> dict[str, str]:
@@ -540,7 +558,7 @@ def sync_pool(
             rejection_reason = pool_rejection_reason(row)
             if rejection_reason:
                 apply_authoritative_rejection(row, rejection_reason, merged_by_key)
-                if row_value(row, "output_file", "整理后文件", "发票文件") or row_value(row, "invoice_number", "发票号码"):
+                if should_write_rejected_pool_row(row, ledger_path, rejection_reason):
                     rejected_rows.append(rejected_pool_row(row, ledger_path, rejection_reason))
                 continue
             raw_key = invoice_key(row)
@@ -729,16 +747,40 @@ def clear_previous_generated_files(target_root: Path) -> None:
         target_root_resolved = target_root.resolve()
     except OSError:
         return
+    generated_files = {target_root / name for name in GENERATED_MANIFESTS}
+    manifest_path = target_root / "发票文件清单.csv"
+    for row in read_csv(manifest_path):
+        copied = row_value(row, "发票文件")
+        if copied:
+            generated_files.add(Path(copied).expanduser())
+    generated_resolved = {path.resolve() for path in generated_files if path.exists()}
+    unknown_files: list[Path] = []
     for copied in sorted([path for path in target_root.rglob("*") if path.is_file()], key=lambda path: len(path.parts), reverse=True):
         try:
             copied_resolved = copied.resolve()
             copied_resolved.relative_to(target_root_resolved)
         except (OSError, ValueError):
             continue
-        try:
-            copied_resolved.unlink()
-        except OSError:
-            pass
+        if copied in generated_files or copied_resolved in generated_resolved:
+            try:
+                copied_resolved.unlink()
+            except OSError:
+                pass
+        else:
+            unknown_files.append(copied)
+    if unknown_files:
+        backup_root = target_root.parent / f"_手动保留_{target_root.name}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        for copied in unknown_files:
+            try:
+                relative = copied.relative_to(target_root)
+            except ValueError:
+                relative = Path(copied.name)
+            backup = backup_root / relative
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.move(str(copied), str(backup))
+            except OSError:
+                pass
     for folder in sorted([path for path in target_root.rglob("*") if path.is_dir()], key=lambda path: len(path.parts), reverse=True):
         try:
             folder.rmdir()

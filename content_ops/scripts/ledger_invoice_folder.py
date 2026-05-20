@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as dt
 import json
 import re
 import shutil
@@ -23,6 +24,7 @@ INVOICE_ROOT = WORKSPACE_ROOT / "发票整理"
 LEDGER_INVOICE_ROOT = INVOICE_ROOT / "台账对应发票"
 MANIFEST_NAME = "发票文件清单.csv"
 VALID_STATUSES = {"Parsed", "AI_Verified", "已解析", "AI复核"}
+GENERATED_MANIFESTS = {MANIFEST_NAME, "缺失文件清单.csv"}
 
 
 def safe_component(value: object, fallback: str = "未分类") -> str:
@@ -45,6 +47,13 @@ def read_ledger_rows(ledger_path: Path) -> tuple[Path, list[dict[str, str]]]:
     csv_path = sibling_csv_for(ledger_path)
     with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
         return csv_path, list(csv.DictReader(handle))
+
+
+def read_csv(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        return list(csv.DictReader(handle))
 
 
 def row_value(row: dict[str, str], *keys: str) -> str:
@@ -90,6 +99,54 @@ def copy_invoice_file(source: Path, target_dir: Path) -> Path:
     return target
 
 
+def clear_previous_generated_files(target_root: Path) -> None:
+    if not target_root.exists():
+        return
+    try:
+        target_root_resolved = target_root.resolve()
+    except OSError:
+        return
+    generated_files = {target_root / name for name in GENERATED_MANIFESTS}
+    manifest_path = target_root / MANIFEST_NAME
+    for row in read_csv(manifest_path):
+        copied = row_value(row, "发票文件")
+        if copied:
+            generated_files.add(Path(copied).expanduser())
+    generated_resolved = {path.resolve() for path in generated_files if path.exists()}
+    unknown_files: list[Path] = []
+    for copied in sorted([path for path in target_root.rglob("*") if path.is_file()], key=lambda path: len(path.parts), reverse=True):
+        try:
+            copied_resolved = copied.resolve()
+            copied_resolved.relative_to(target_root_resolved)
+        except (OSError, ValueError):
+            continue
+        if copied in generated_files or copied_resolved in generated_resolved:
+            try:
+                copied.unlink()
+            except OSError:
+                pass
+        else:
+            unknown_files.append(copied)
+    if unknown_files:
+        backup_root = target_root.parent / f"_手动保留_{target_root.name}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        for copied in unknown_files:
+            try:
+                relative = copied.relative_to(target_root)
+            except ValueError:
+                relative = Path(copied.name)
+            backup = backup_root / relative
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.move(str(copied), str(backup))
+            except OSError:
+                pass
+    for folder in sorted([path for path in target_root.rglob("*") if path.is_dir()], key=lambda path: len(path.parts), reverse=True):
+        try:
+            folder.rmdir()
+        except OSError:
+            pass
+
+
 def prepare_ledger_invoice_folder(
     ledger_path: Path,
     rows: list[dict[str, str]] | None = None,
@@ -104,6 +161,7 @@ def prepare_ledger_invoice_folder(
     folder_name = safe_component(ledger_path.with_suffix("").name, "发票台账")
     target_root = folder_root / folder_name
     target_root.mkdir(parents=True, exist_ok=True)
+    clear_previous_generated_files(target_root)
 
     copied_rows: list[dict[str, str]] = []
     missing_rows: list[dict[str, str]] = []
