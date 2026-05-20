@@ -2,8 +2,8 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-private let appVersion = "0.1.5"
-private let appBuild = "20260519.5"
+private let appVersion = "0.1.6"
+private let appBuild = "20260520.1"
 private let appEdition = "带图标数据安全版"
 private let workspaceRoot = Bundle.main.bundleURL.deletingLastPathComponent()
 private let invoiceRoot = workspaceRoot.appendingPathComponent("发票整理")
@@ -1647,6 +1647,7 @@ struct RunCenterView: View {
             VStack(alignment: .leading, spacing: 18) {
                 header
                 controls
+                importSummaryView
                 if let summary = model.lastSummary {
                     summaryView(summary)
                 } else if !model.lastError.isEmpty {
@@ -1757,6 +1758,75 @@ struct RunCenterView: View {
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
+    private var importSummaryView: some View {
+        let total = model.reimbursementStatus.totalInvoices ?? 0
+        let amount = model.reimbursementStatus.totalAmount ?? 0
+        let pending = model.reimbursementStatus.pendingInvoices ?? 0
+        let poolPath = model.reimbursementStatus.poolXlsx ?? ""
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("截止目前汇总（导入用）", systemImage: "tray.full.fill")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(.blue)
+                    Text("这里和“报销管理”的累计池是同一份。需要导入报销时，优先打开这份 Excel。")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 6) {
+                    Text(money(amount))
+                        .font(.title2.monospacedDigit().weight(.semibold))
+                    Text(poolDateText)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            HStack(spacing: 14) {
+                metric("汇总发票", "\(total) 张")
+                metric("待导入", "\(pending) 张")
+                metric("已进批次", "\(model.reimbursementStatus.reimbursedInvoices ?? 0) 张")
+            }
+            HStack {
+                Button {
+                    model.openURL(path: poolPath)
+                } label: {
+                    Label("打开导入 Excel", systemImage: "tablecells")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(poolPath.isEmpty)
+                Button {
+                    model.openURL(path: model.reimbursementStatus.poolCsv ?? "")
+                } label: {
+                    Label("打开 CSV", systemImage: "doc.plaintext")
+                }
+                .disabled((model.reimbursementStatus.poolCsv ?? "").isEmpty)
+                Button {
+                    model.openPreparedOrPrepareReimbursementInvoiceFolder(scope: "all")
+                } label: {
+                    Label("打开对应发票文件夹", systemImage: "folder")
+                }
+                .disabled(model.isReimbursementWorking || total == 0)
+                Button {
+                    model.refreshReimbursementPool()
+                } label: {
+                    Label("刷新汇总", systemImage: "arrow.clockwise")
+                }
+                .disabled(model.isReimbursementWorking)
+                Spacer()
+            }
+            if total == 0 {
+                Text("还没有生成累计池。先运行一次整理，或点击刷新汇总。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("这份汇总会随报销池刷新而更新；历史扫描台账只用于追溯，不建议作为报销导入版本。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(18)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
     private func summaryView(_ summary: RunSummary) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
@@ -1848,6 +1918,15 @@ struct RunCenterView: View {
         "¥" + String(format: "%.2f", value)
     }
 
+    private var poolDateText: String {
+        let from = model.reimbursementStatus.pendingDateFrom ?? ""
+        let to = model.reimbursementStatus.pendingDateTo ?? ""
+        if !from.isEmpty && !to.isEmpty {
+            return "\(from) 至 \(to)"
+        }
+        return "截止目前"
+    }
+
     private func noticeView(title: String, message: String, systemImage: String, color: Color) -> some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: systemImage)
@@ -1880,8 +1959,13 @@ struct RunCenterView: View {
     private var recentLedgers: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("最近台账")
-                    .font(.headline)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("最近扫描台账")
+                        .font(.headline)
+                    Text("这里是每次扫描留下的流水记录；报销导入请用上方“截止目前汇总”。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 Button {
                     model.refreshLedgers()
