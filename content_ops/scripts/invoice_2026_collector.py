@@ -98,17 +98,9 @@ SUBJECT_KEYWORDS = (
 
 BODY_RECALL_KEYWORDS = (
     "发票",
-    "电子发票",
-    "发票下载",
-    "下载发票",
     "开票",
-    "开票成功",
-    "开具成功",
-    "点击下载",
+    "开具",
     "Invoice",
-    "Tax Invoice",
-    "download invoice",
-    "view invoice",
 )
 
 PRIORITY_SENDER_DOMAINS = (
@@ -1361,6 +1353,13 @@ def make_link_headers(env: dict[str, str]) -> dict[str, str]:
     }
 
 
+def link_download_timeout(env: dict[str, str]) -> float:
+    try:
+        return max(5.0, float(env.get("LINK_DOWNLOAD_TIMEOUT_SECONDS") or LINK_DOWNLOAD_TIMEOUT_SECONDS))
+    except ValueError:
+        return float(LINK_DOWNLOAD_TIMEOUT_SECONDS)
+
+
 def infer_download_extension(url: str, content_type: str, content_disposition: str, data: bytes) -> str:
     combined = f"{url} {content_type} {content_disposition}".lower()
     stripped = data.lstrip()[:200].lower()
@@ -1397,12 +1396,13 @@ def read_limited_response(response: object, limit: int = MAX_LINK_DOWNLOAD_BYTES
 
 def fetch_url_bytes(url: str, env: dict[str, str], retry_attempts: int, retry_sleep: float) -> tuple[bytes, str, str, str]:
     headers = make_link_headers(env)
+    timeout_seconds = link_download_timeout(env)
     if "chinatax.gov.cn" in (urlparse(url).hostname or "").lower():
         headers["User-Agent"] = env.get("LINK_USER_AGENT") or "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
     def urllib_once() -> tuple[bytes, str, str, str]:
         req = urlrequest.Request(url, headers=headers)
-        with urlrequest.urlopen(req, timeout=LINK_DOWNLOAD_TIMEOUT_SECONDS) as response:
+        with urlrequest.urlopen(req, timeout=timeout_seconds) as response:
             data = read_limited_response(response)
             content_type = str(response.headers.get("Content-Type") or "")
             disposition = str(response.headers.get("Content-Disposition") or "")
@@ -1416,7 +1416,7 @@ def fetch_url_bytes(url: str, env: dict[str, str], retry_attempts: int, retry_sl
             with httpx.Client(
                 follow_redirects=True,
                 headers=headers,
-                timeout=LINK_DOWNLOAD_TIMEOUT_SECONDS,
+                timeout=timeout_seconds,
                 trust_env=False,
             ) as client:
                 response = client.get(url)
@@ -1452,6 +1452,7 @@ def resolve_bwjf_pdf_url(url: str, env: dict[str, str], retry_attempts: int, ret
         return ""
 
     headers = make_link_headers(env)
+    timeout_seconds = link_download_timeout(env)
 
     def once() -> str:
         import httpx
@@ -1459,7 +1460,7 @@ def resolve_bwjf_pdf_url(url: str, env: dict[str, str], retry_attempts: int, ret
         with httpx.Client(
             follow_redirects=False,
             headers=headers,
-            timeout=LINK_DOWNLOAD_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
             trust_env=False,
         ) as client:
             response = client.get(url)
@@ -1475,7 +1476,7 @@ def resolve_bwjf_pdf_url(url: str, env: dict[str, str], retry_attempts: int, ret
         with httpx.Client(
             follow_redirects=True,
             headers=headers,
-            timeout=LINK_DOWNLOAD_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
             trust_env=False,
         ) as client:
             response = client.get(url)
@@ -1542,11 +1543,12 @@ def fetch_nuonuo_pdf_artifact(
 ) -> tuple[bytes, str, str, str] | None:
     headers = make_link_headers(env)
     headers.setdefault("Referer", url)
+    timeout_seconds = link_download_timeout(env)
 
     def once() -> tuple[bytes, str, str, str] | None:
         import httpx
 
-        with httpx.Client(follow_redirects=True, headers=headers, timeout=LINK_DOWNLOAD_TIMEOUT_SECONDS, trust_env=False) as client:
+        with httpx.Client(follow_redirects=True, headers=headers, timeout=timeout_seconds, trust_env=False) as client:
             landing = client.get(url)
             landing.raise_for_status()
             resolved_url = str(landing.url or url)
@@ -1884,10 +1886,11 @@ def fetch_apple_fdfinvoice_artifacts(
             "Referer": url,
         }
     )
+    timeout_seconds = link_download_timeout(env)
 
     def once() -> list[dict[str, str]]:
         req = urlrequest.Request(endpoint, data=order_ref_no.encode("utf-8"), headers=headers, method="POST")
-        with urlrequest.urlopen(req, timeout=LINK_DOWNLOAD_TIMEOUT_SECONDS) as response:
+        with urlrequest.urlopen(req, timeout=timeout_seconds) as response:
             body = response.read(MAX_LINK_DOWNLOAD_BYTES)
         payload = json.loads(body.decode("utf-8", errors="replace"))
         if str(payload.get("code")) != "200":
@@ -2391,13 +2394,7 @@ class ProcessLog:
         ).fetchone()
         if row is None:
             return False
-        return str(row[0] or "") not in {
-            "failed",
-            "fetch_failed",
-            "timeout",
-            "imap_timeout",
-            "skipped_subject_filter",
-        }
+        return str(row[0] or "") not in {"failed", "fetch_failed", "timeout", "imap_timeout"}
 
     def mark(self, mailbox: str, uid: bytes | str, status: str, records_count: int = 0, error: str = "") -> None:
         uid_text = uid.decode("ascii", errors="replace") if isinstance(uid, bytes) else str(uid)
@@ -3067,6 +3064,8 @@ def append_row_cache(cache_path: Path, mailbox: str, uid: bytes | str, status: s
     }
     with cache_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def load_row_cache(cache_path: Path) -> list[dict[str, str]]:
@@ -3415,8 +3414,8 @@ def scan_mailbox(
                             message_rows = []
                             error = str(exc)
                         rows.extend(message_rows)
-                        log.mark(mailbox, uid, status, len(message_rows), error)
                         append_row_cache(row_cache, mailbox, uid, status, message_rows, error)
+                        log.mark(mailbox, uid, status, len(message_rows), error)
                         progress.update(1)
                         progress.set_postfix(records=len(rows), last=status)
         finally:

@@ -2,8 +2,8 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-private let appVersion = "0.1.11"
-private let appBuild = "20260520.7"
+private let appVersion = "0.1.14"
+private let appBuild = "20260520.10"
 private let appEdition = "带图标数据安全版"
 private let workspaceRoot = Bundle.main.bundleURL.deletingLastPathComponent()
 private let invoiceRoot = workspaceRoot.appendingPathComponent("发票整理")

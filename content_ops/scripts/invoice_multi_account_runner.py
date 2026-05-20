@@ -7,7 +7,10 @@ import argparse
 import csv
 import datetime as dt
 import json
+import multiprocessing as mp
 from pathlib import Path
+import queue as queue_module
+import re
 import sys
 import time
 from typing import Iterable
@@ -23,6 +26,7 @@ INVOICE_ROOT = WORKSPACE_ROOT / "发票整理"
 CONFIG_DIR = INVOICE_ROOT / "私密配置"
 REPORT_DIR = INVOICE_ROOT / "台账"
 STATE_DIR = INVOICE_ROOT / "运行状态"
+DEFAULT_ACCOUNT_TIMEOUT_SECONDS = 60 * 60
 
 sys.path.insert(0, str(SCRIPT_DIR))
 import invoice_2026_collector as collector  # noqa: E402
@@ -134,6 +138,10 @@ def account_env(base_env: dict[str, str], account: dict[str, object]) -> dict[st
     env["QQ_MAILBOX"] = str(account.get("mailbox") or env.get("QQ_MAILBOX") or "INBOX")
     if account.get("imap_timeout_seconds"):
         env["IMAP_TIMEOUT_SECONDS"] = str(account.get("imap_timeout_seconds") or "")
+    if account.get("account_timeout_seconds"):
+        env["ACCOUNT_TIMEOUT_SECONDS"] = str(account.get("account_timeout_seconds") or "")
+    if account.get("link_download_timeout_seconds"):
+        env["LINK_DOWNLOAD_TIMEOUT_SECONDS"] = str(account.get("link_download_timeout_seconds") or "")
     if account.get("search_mode"):
         env["INVOICE_SEARCH_MODE"] = str(account.get("search_mode") or "")
     return env
@@ -160,6 +168,88 @@ def annotate_rows(rows: list[dict[str, str]], account: dict[str, object], env: d
         item["account_email"] = env.get("QQ_EMAIL", "")
         annotated.append(item)
     return annotated
+
+
+def account_timeout_seconds(env: dict[str, str]) -> float:
+    try:
+        return max(60.0, float(env.get("ACCOUNT_TIMEOUT_SECONDS") or DEFAULT_ACCOUNT_TIMEOUT_SECONDS))
+    except ValueError:
+        return float(DEFAULT_ACCOUNT_TIMEOUT_SECONDS)
+
+
+def sanitize_error(value: object) -> str:
+    text = str(value or "")
+    text = re.sub(r"https?://\S+", "<url>", text)
+    text = re.sub(r"(?i)(auth[_-]?code|password|token|secret|key)=([^\s&]+)", r"\1=<redacted>", text)
+    return text[:500]
+
+
+def scan_account_worker(
+    result_queue: mp.Queue,
+    env: dict[str, str],
+    since: str,
+    until: str,
+    limit: int | None,
+    log_db: str,
+    reprocess: bool,
+    cache_path: str,
+) -> None:
+    cache = Path(cache_path)
+    try:
+        rows = collector.scan_mailbox(
+            env,
+            since,
+            until,
+            limit,
+            log_db=Path(log_db),
+            reprocess=reprocess,
+            row_cache=cache,
+        )
+        result_queue.put({"status": "completed", "rows": rows, "error": ""})
+    except BaseException as exc:
+        cached_rows = collector.load_row_cache(cache) if cache.exists() else []
+        result_queue.put({"status": "failed", "rows": cached_rows, "error": sanitize_error(exc)})
+
+
+def run_account_scan_with_timeout(
+    env: dict[str, str],
+    since: str,
+    until: str,
+    limit: int | None,
+    log_db: Path,
+    reprocess: bool,
+    cache_path: Path,
+) -> tuple[list[dict[str, str]], str, str]:
+    timeout_seconds = account_timeout_seconds(env)
+    context = mp.get_context("spawn")
+    result_queue: mp.Queue = context.Queue()
+    process = context.Process(
+        target=scan_account_worker,
+        args=(result_queue, env, since, until, limit, str(log_db), reprocess, str(cache_path)),
+    )
+    process.start()
+    process.join(timeout_seconds)
+    if process.is_alive():
+        process.terminate()
+        process.join(10)
+        if process.is_alive():
+            process.kill()
+            process.join(10)
+        cached_rows = collector.load_row_cache(cache_path) if cache_path.exists() else []
+        return cached_rows, "timeout", f"账号扫描超过 {int(timeout_seconds)} 秒，已停止并保留已落盘结果。"
+
+    try:
+        result = result_queue.get_nowait()
+    except queue_module.Empty:
+        cached_rows = collector.load_row_cache(cache_path) if cache_path.exists() else []
+        if process.exitcode == 0:
+            return cached_rows, "completed", ""
+        return cached_rows, "failed", f"账号扫描异常退出，exitcode={process.exitcode}。"
+
+    rows = result.get("rows") if isinstance(result, dict) else []
+    status = str(result.get("status") or "failed") if isinstance(result, dict) else "failed"
+    error = sanitize_error(result.get("error") or "") if isinstance(result, dict) else "账号扫描结果格式异常。"
+    return list(rows or []), status, error
 
 
 def run_accounts(
@@ -195,14 +285,14 @@ def run_accounts(
         log_db = account_log_path(account_id)
         cache_path = row_cache_path(account_id, since, until, limit)
         print(f"开始扫描账号：{account_id} <{mask_email(env.get('QQ_EMAIL', ''))}>")
-        rows = collector.scan_mailbox(
+        rows, account_status, account_error = run_account_scan_with_timeout(
             env,
             since,
             until,
             limit,
             log_db=log_db,
             reprocess=reprocess,
-            row_cache=cache_path,
+            cache_path=cache_path,
         )
         annotated = annotate_rows(rows, account, env)
         all_new_rows.extend(annotated)
@@ -214,6 +304,8 @@ def run_accounts(
                 "rows": len(annotated),
                 "row_cache": str(cache_path),
                 "log_db": str(log_db),
+                "status": account_status,
+                "error": account_error,
             }
         )
 
@@ -222,15 +314,28 @@ def run_accounts(
     xlsx_path = collector.write_xlsx_report(merged_rows, report_path)
     invoice_folder_summary = ledger_invoice_folder.prepare_ledger_invoice_folder(report_path, rows=merged_rows)
     reimbursement_rows = reimbursement_manager.sync_pool()
+    pending_file_summary = reimbursement_manager.prepare_invoice_files_folder(scope="pending")
+    all_file_summary = reimbursement_manager.prepare_invoice_files_folder(scope="all")
     reimbursement_summary = reimbursement_manager.status_summary(reimbursement_rows)
     reimbursement_audit = reimbursement_manager.audit_summary(reimbursement_rows)
     formal_rows = [row for row in merged_rows if collector.row_is_countable_invoice(row)]
     new_formal_rows = [row for row in collector.clean_manifest_rows(all_new_rows) if collector.row_is_countable_invoice(row)]
     total_amount = sum(collector.effective_amount(row) for row in formal_rows)
     new_total_amount = sum(collector.effective_amount(row) for row in new_formal_rows)
+    account_issue_count = sum(1 for item in account_summaries if item.get("status") != "completed")
+    prepare_issue_count = sum(
+        1
+        for item in (pending_file_summary, all_file_summary)
+        if item.get("status") != "invoice_files_prepared" or int(item.get("missing_invoice_files") or 0) > 0
+    )
+    audit_issue_count = int(reimbursement_audit.get("audit_issues") or 0)
+    run_issue_count = account_issue_count + prepare_issue_count + audit_issue_count
     summary = {
-        "status": "completed",
+        "status": "completed" if run_issue_count == 0 else "completed_with_issues",
         "accounts": account_summaries,
+        "account_issues": account_issue_count,
+        "prepare_issues": prepare_issue_count,
+        "run_issues": run_issue_count,
         "new_rows": len(all_new_rows),
         "new_formal_invoices": len(new_formal_rows),
         "new_formal_amount": round(new_total_amount, 2),
@@ -246,6 +351,10 @@ def run_accounts(
         "invoice_files": int(invoice_folder_summary.get("invoice_files") or 0),
         "missing_invoice_files": int(invoice_folder_summary.get("missing_files") or 0),
         "cumulative_ledger": str(reimbursement_summary.get("pool_xlsx") or ""),
+        "pending_invoice_folder": str(pending_file_summary.get("invoice_folder") or ""),
+        "pending_invoice_folder_manifest": str(pending_file_summary.get("invoice_folder_manifest") or ""),
+        "all_invoice_folder": str(all_file_summary.get("invoice_folder") or ""),
+        "all_invoice_folder_manifest": str(all_file_summary.get("invoice_folder_manifest") or ""),
         "pending_reimbursement_invoices": int(reimbursement_summary.get("pending_invoices") or 0),
         "reimbursed_invoices": int(reimbursement_summary.get("reimbursed_invoices") or 0),
         "reimbursement_audit_status": str(reimbursement_audit.get("status") or ""),
@@ -287,7 +396,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     summary_json = json.dumps(summary, ensure_ascii=False)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     print(f"INVOICE_SUMMARY_JSON={summary_json}")
-    return 0
+    return 0 if summary.get("status") == "completed" else 2
 
 
 if __name__ == "__main__":

@@ -18,6 +18,8 @@ accounts:
     imap_host: imap.qq.com
     imap_port: 993
     mailbox: INBOX
+    account_timeout_seconds: 3600
+    link_download_timeout_seconds: 30
 
   - id: aliyun_main
     label: 阿里邮箱
@@ -32,6 +34,8 @@ accounts:
     imap_port: 993
     mailbox: INBOX
     imap_timeout_seconds: 30
+    account_timeout_seconds: 3600
+    link_download_timeout_seconds: 30
     # Ali enterprise IMAP can reject Chinese SUBJECT searches. Date-only keeps
     # the server-side window and lets the local invoice filter finish the job.
     search_mode: date_only
