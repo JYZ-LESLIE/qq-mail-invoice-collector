@@ -2,8 +2,8 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-private let appVersion = "0.1.6"
-private let appBuild = "20260520.1"
+private let appVersion = "0.1.7"
+private let appBuild = "20260520.2"
 private let appEdition = "带图标数据安全版"
 private let workspaceRoot = Bundle.main.bundleURL.deletingLastPathComponent()
 private let invoiceRoot = workspaceRoot.appendingPathComponent("发票整理")
@@ -381,6 +381,7 @@ final class InvoiceAppModel: ObservableObject {
     @Published var reprocess = false
     @Published var demoMode = true
     @Published var baseReportPath = ""
+    @Published var showAdvancedLedgerMerge = false
     @Published var logText = ""
     @Published var isRunning = false
     @Published var lastSummary: RunSummary?
@@ -623,6 +624,7 @@ final class InvoiceAppModel: ObservableObject {
         let limitValue = Int(limit.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
         let reprocessValue = reprocess
         let baseReportValue = baseReportPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let usedAdvancedBaseReport = !baseReportValue.isEmpty
 
         Task.detached {
             var arguments = [
@@ -659,6 +661,10 @@ final class InvoiceAppModel: ObservableObject {
                     self.refreshReviewItems()
                 } else {
                     self.lastError = result.exitCode == 0 ? "任务完成，但没有读取到结构化结果。" : "任务运行失败，退出码 \(result.exitCode)。"
+                }
+                if usedAdvancedBaseReport {
+                    self.baseReportPath = ""
+                    self.showAdvancedLedgerMerge = false
                 }
                 if self.shouldQuitAfterRun {
                     NSApp.terminate(nil)
@@ -1075,7 +1081,8 @@ final class InvoiceAppModel: ObservableObject {
 
     func chooseBaseReport() {
         let panel = NSOpenPanel()
-        panel.title = "选择要合并的旧 CSV 台账"
+        panel.title = "高级修复：选择旧扫描 CSV 台账"
+        panel.message = "正常扫新发票不需要选这里。只有在旧扫描台账需要重新合并时才使用。"
         panel.allowedContentTypes = [.commaSeparatedText]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
@@ -1146,12 +1153,14 @@ final class InvoiceAppModel: ObservableObject {
         let untilText = Self.dateFormatter.string(from: until)
         var info = demoMode
             ? "当前是演示模式，不会连接邮箱，只会展示运行完成后的界面。"
-            : "将读取 \(accountCount) 个邮箱，时间范围 \(sinceText) 至 \(untilText)，下载疑似发票并生成台账。"
+            : "将读取 \(accountCount) 个邮箱，邮件时间范围 \(sinceText) 至 \(untilText)，下载疑似发票并生成台账。"
         if reprocess {
             info += "\n\n已开启“重新检查已处理邮件”，运行时间会更长，并可能重新下载历史线索。"
         }
         if !baseReportPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            info += "\n\n本次会合并你选择的旧台账。"
+            info += "\n\n本次会额外合并一个旧扫描台账。这只用于修复历史流水，报销导入仍以“截止目前汇总”为准。"
+        } else {
+            info += "\n\n完成后会自动刷新“截止目前汇总（导入用）”。新发票会进入当前累计池，不需要手动选择旧台账。"
         }
         info += "\n\n不会提交或显示邮箱授权码。"
         alert.informativeText = info
@@ -1701,7 +1710,7 @@ struct RunCenterView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("运行中心")
                     .font(.largeTitle.weight(.semibold))
-                Text("选择邮箱和时间，自动整理中国发票，完成后生成可报销核对的 Excel 台账。")
+                Text("选择邮箱和邮件时间，自动整理中国发票，完成后刷新可报销导入的累计池。")
                     .foregroundStyle(.secondary)
             }
             Spacer()
@@ -1720,8 +1729,8 @@ struct RunCenterView: View {
     private var controls: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 16) {
-                DatePicker("开始日期", selection: $model.since, displayedComponents: .date)
-                DatePicker("结束日期", selection: $model.until, displayedComponents: .date)
+                DatePicker("邮件开始日期", selection: $model.since, displayedComponents: .date)
+                DatePicker("邮件结束日期", selection: $model.until, displayedComponents: .date)
                 TextField("最多检查邮件数，0 为不限制", text: $model.limit)
                     .frame(width: 180)
                     .textFieldStyle(.roundedBorder)
@@ -1732,21 +1741,33 @@ struct RunCenterView: View {
                 Toggle("演示模式，不连接邮箱", isOn: $model.demoMode)
                 Toggle("强制重跑已处理邮件", isOn: $model.reprocess)
                     .disabled(model.demoMode)
-                TextField("旧台账，可留空", text: $model.baseReportPath)
-                    .textFieldStyle(.roundedBorder)
-                    .disabled(model.demoMode)
-                Button {
-                    model.chooseBaseReport()
-                } label: {
-                    Label("选择", systemImage: "doc.badge.plus")
+                Label("新扫到的发票会自动进入本轮累计池", systemImage: "tray.full")
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            DisclosureGroup("高级修复：合并旧扫描台账", isExpanded: $model.showAdvancedLedgerMerge) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("正常报销不用选这里。只有要修复某个历史扫描流水时，才选择“发票整理/台账”里的 CSV。报销导入始终打开下方“截止目前汇总”。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 12) {
+                        TextField("旧扫描 CSV，可留空", text: $model.baseReportPath)
+                            .textFieldStyle(.roundedBorder)
+                            .disabled(model.demoMode)
+                        Button {
+                            model.chooseBaseReport()
+                        } label: {
+                            Label("选择旧扫描", systemImage: "doc.badge.plus")
+                        }
+                        .disabled(model.demoMode)
+                        Button {
+                            model.baseReportPath = ""
+                        } label: {
+                            Label("清空", systemImage: "xmark.circle")
+                        }
+                        .disabled(model.demoMode || model.baseReportPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
                 }
-                .disabled(model.demoMode)
-                Button {
-                    model.baseReportPath = ""
-                } label: {
-                    Label("清空", systemImage: "xmark.circle")
-                }
-                .disabled(model.demoMode)
             }
             if model.demoMode {
                 Text("演示模式只用于验收界面，不会读取邮箱。关闭后才会真正整理发票。")
@@ -1763,6 +1784,8 @@ struct RunCenterView: View {
         let amount = model.reimbursementStatus.totalAmount ?? 0
         let pending = model.reimbursementStatus.pendingInvoices ?? 0
         let poolPath = model.reimbursementStatus.poolXlsx ?? ""
+        let duplicateGroups = model.reimbursementStatus.duplicateInvoiceFileGroups ?? 0
+        let importBlocked = duplicateGroups > 0
         return VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 6) {
@@ -1792,7 +1815,7 @@ struct RunCenterView: View {
                     Label("打开导入 Excel", systemImage: "tablecells")
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(poolPath.isEmpty)
+                .disabled(poolPath.isEmpty || importBlocked)
                 Button {
                     model.openURL(path: model.reimbursementStatus.poolCsv ?? "")
                 } label: {
@@ -1813,7 +1836,11 @@ struct RunCenterView: View {
                 .disabled(model.isReimbursementWorking)
                 Spacer()
             }
-            if total == 0 {
+            if importBlocked {
+                Text("发现 \(duplicateGroups) 组发票文件重复指向，先到“报销管理”处理后再导入。")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            } else if total == 0 {
                 Text("还没有生成累计池。先运行一次整理，或点击刷新汇总。")
                     .font(.caption)
                     .foregroundStyle(.secondary)

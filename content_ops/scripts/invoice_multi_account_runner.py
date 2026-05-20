@@ -42,6 +42,12 @@ def load_accounts_config(path: Path) -> dict[str, object]:
 def load_base_rows(path: Path | None) -> list[dict[str, str]]:
     if not path or not path.exists():
         return []
+    resolved = path.resolve()
+    if path.name == "累计发票池.csv" or "报销管理" in resolved.parts:
+        raise SystemExit(
+            "--base-report 只能用于合并“发票整理/台账”里的历史扫描 CSV。"
+            "报销导入请直接打开“发票整理/报销管理/累计发票池.xlsx”，不需要把累计池作为旧台账。"
+        )
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.DictReader(handle))
     for row in rows:
@@ -156,30 +162,6 @@ def annotate_rows(rows: list[dict[str, str]], account: dict[str, object], env: d
     return annotated
 
 
-def parse_row_date(value: str) -> dt.date | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    try:
-        return dt.date.fromisoformat(text[:10])
-    except ValueError:
-        return None
-
-
-def filter_formal_rows_by_invoice_date(rows: list[dict[str, str]], since: str, until: str) -> list[dict[str, str]]:
-    since_date = dt.date.fromisoformat(since)
-    until_date = dt.date.fromisoformat(until)
-    filtered: list[dict[str, str]] = []
-    for row in rows:
-        if row.get("status") not in {"Parsed", "AI_Verified"}:
-            filtered.append(row)
-            continue
-        invoice_date = parse_row_date(str(row.get("invoice_date") or ""))
-        if invoice_date and since_date <= invoice_date <= until_date:
-            filtered.append(row)
-    return filtered
-
-
 def run_accounts(
     *,
     accounts_path: Path,
@@ -235,13 +217,13 @@ def run_accounts(
             }
         )
 
-    all_new_rows = filter_formal_rows_by_invoice_date(all_new_rows, since, until)
-    merged_rows = collector.clean_manifest_rows(filter_formal_rows_by_invoice_date(base_rows + all_new_rows, since, until))
+    merged_rows = collector.clean_manifest_rows(base_rows + all_new_rows)
     report_path = collector.write_report(merged_rows)
     xlsx_path = collector.write_xlsx_report(merged_rows, report_path)
     invoice_folder_summary = ledger_invoice_folder.prepare_ledger_invoice_folder(report_path, rows=merged_rows)
     reimbursement_rows = reimbursement_manager.sync_pool()
     reimbursement_summary = reimbursement_manager.status_summary(reimbursement_rows)
+    reimbursement_audit = reimbursement_manager.audit_summary(reimbursement_rows)
     formal_rows = [row for row in merged_rows if collector.row_is_countable_invoice(row)]
     new_formal_rows = [row for row in collector.clean_manifest_rows(all_new_rows) if collector.row_is_countable_invoice(row)]
     total_amount = sum(collector.effective_amount(row) for row in formal_rows)
@@ -266,6 +248,9 @@ def run_accounts(
         "cumulative_ledger": str(reimbursement_summary.get("pool_xlsx") or ""),
         "pending_reimbursement_invoices": int(reimbursement_summary.get("pending_invoices") or 0),
         "reimbursed_invoices": int(reimbursement_summary.get("reimbursed_invoices") or 0),
+        "reimbursement_audit_status": str(reimbursement_audit.get("status") or ""),
+        "reimbursement_audit_issues": int(reimbursement_audit.get("audit_issues") or 0),
+        "duplicate_invoice_file_groups": int(reimbursement_summary.get("duplicate_invoice_file_groups") or 0),
         "base_report": str(base_report or ""),
         "elapsed_seconds": round(time.time() - started, 1),
     }
@@ -283,7 +268,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--account", action="append", default=None, help="Run only this account id. Can be repeated.")
     parser.add_argument("--reprocess", action="store_true")
-    parser.add_argument("--base-report", type=Path, default=None, help="Existing CSV manifest to merge with.")
+    parser.add_argument("--base-report", type=Path, default=None, help="Advanced repair only: existing scan CSV manifest to merge with.")
     parser.add_argument("--list-accounts", action="store_true", help="Print configured accounts without reading mailbox credentials.")
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.list_accounts:

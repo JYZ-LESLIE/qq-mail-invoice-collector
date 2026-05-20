@@ -425,7 +425,7 @@ def sync_pool(
 ) -> list[dict[str, str]]:
     REIMBURSEMENT_ROOT.mkdir(parents=True, exist_ok=True)
     existing_by_key = {row.get("发票唯一键", ""): row for row in read_csv(pool_csv) if row.get("发票唯一键")}
-    merged_by_key: dict[str, dict[str, str]] = {}
+    merged_by_key: dict[str, dict[str, str]] = dict(existing_by_key)
     rejected_rows: list[dict[str, str]] = []
 
     for ledger_path in ledger_csv_files(ledger_dir):
