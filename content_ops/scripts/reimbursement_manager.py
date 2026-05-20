@@ -85,6 +85,22 @@ FOREIGN_RECEIPT_MARKERS = (
     "amount due",
 )
 
+FOREIGN_RECEIPT_TEXT_FIELDS = (
+    "seller",
+    "收款方",
+    "purchaser",
+    "付款方",
+    "mail_subject",
+    "邮件主题",
+    "attachment_original_name",
+    "附件原名",
+    "invoice_kind",
+    "发票类型",
+    "category",
+    "note",
+    "备注",
+)
+
 BAD_PARTY_VALUES = {
     "销",
     "购",
@@ -95,6 +111,13 @@ BAD_PARTY_VALUES = {
     "纳税人识别号",
     "开票人",
 }
+
+BAD_PARTY_MARKERS = (
+    "差额征税",
+    "差额开票",
+    "购买方信息",
+    "销售方信息",
+)
 
 
 def now_text() -> str:
@@ -150,6 +173,8 @@ def party_quality_issue(value: object, *, allow_personal: bool = False) -> str:
         return "关键字段空白"
     if allow_personal and normalized in {"个人", "季元征", "季元徵"}:
         return ""
+    if any(marker in text or marker in normalized for marker in BAD_PARTY_MARKERS):
+        return "识别到票面标签，不是公司/个人名称"
     if normalized in BAD_PARTY_VALUES or normalized.startswith("名称_"):
         return "识别到票面标签，不是公司/个人名称"
     if not has_chinese(text):
@@ -165,6 +190,10 @@ def row_text(row: dict[str, str], *extra_values: object) -> str:
     return " ".join(str(value or "") for value in values)
 
 
+def selected_row_text(row: dict[str, str], fields: Iterable[str]) -> str:
+    return " ".join(str(row.get(field) or "") for field in fields)
+
+
 def invoice_year(value: object) -> int | None:
     match = re.search(r"(20\d{2})", str(value or ""))
     if not match:
@@ -173,7 +202,7 @@ def invoice_year(value: object) -> int | None:
 
 
 def foreign_receipt_reason(row: dict[str, str]) -> str:
-    combined = row_text(row).lower()
+    combined = selected_row_text(row, FOREIGN_RECEIPT_TEXT_FIELDS).lower()
     if any(marker in combined for marker in FOREIGN_RECEIPT_MARKERS):
         return "海外收据/外币账单，不是中国税务发票"
     if "$" in combined and not any(marker in combined for marker in ("增值税", "数电", "电子发票")):
@@ -331,6 +360,79 @@ def pool_rejection_reason(row: dict[str, str]) -> str:
     return ""
 
 
+def rejection_should_remove_existing_pool_row(reason: str) -> bool:
+    if reason in {
+        "已标记不计入汇总",
+        "Apple 个人电子收据号，不是换开后的税务发票号码",
+        "缺少有效中国税务发票号码",
+        "海外收据/外币账单，不是中国税务发票",
+        "外币符号账单，不是中国税务发票",
+    }:
+        return True
+    if reason.startswith(("收款方", "付款方")):
+        return True
+    return False
+
+
+def normalized_file_reference(value: object) -> str:
+    source_text = str(value or "").strip()
+    if not source_text:
+        return ""
+    source = Path(source_text).expanduser()
+    if not source.is_absolute():
+        source = (WORKSPACE_ROOT / source).resolve()
+    try:
+        return str(source.resolve())
+    except OSError:
+        return str(source)
+
+
+def rejection_match_keys(row: dict[str, str], merged_by_key: dict[str, dict[str, str]]) -> list[str]:
+    keys: list[str] = []
+    raw_key = invoice_key(row)
+    if raw_key in merged_by_key:
+        keys.append(raw_key)
+
+    invoice_number = normalized_invoice_number(row_value(row, "invoice_number", "发票号码"))
+    source_path = normalized_file_reference(row_value(row, "output_file", "整理后文件", "发票文件"))
+    for key, existing in merged_by_key.items():
+        if key in keys:
+            continue
+        existing_number = normalized_invoice_number(row_value(existing, "invoice_number", "发票号码"))
+        if invoice_number and existing_number == invoice_number:
+            keys.append(key)
+            continue
+        existing_source = normalized_file_reference(row_value(existing, "发票文件", "output_file", "整理后文件"))
+        if source_path and existing_source == source_path:
+            keys.append(key)
+    return keys
+
+
+def can_remove_existing_for_rejection(existing: dict[str, str], reason: str) -> bool:
+    if is_reimbursed(existing):
+        return False
+    if reason == "缺少有效中国税务发票号码":
+        return not is_china_tax_invoice_number(row_value(existing, "invoice_number", "发票号码"))
+    if reason.startswith(("收款方", "付款方")):
+        return pool_rejection_reason(existing) == reason
+    return True
+
+
+def apply_authoritative_rejection(row: dict[str, str], reason: str, merged_by_key: dict[str, dict[str, str]]) -> None:
+    if not rejection_should_remove_existing_pool_row(reason):
+        return
+    for key in rejection_match_keys(row, merged_by_key):
+        existing = merged_by_key.get(key)
+        if not existing:
+            continue
+        if is_reimbursed(existing):
+            append_note_once(existing, f"后续台账标记不计入：{reason}，已进报销批次需人工核查。")
+            existing["最近更新时间"] = now_text()
+            continue
+        if can_remove_existing_for_rejection(existing, reason):
+            merged_by_key.pop(key, None)
+
+
 def should_pool_row(row: dict[str, str]) -> bool:
     return not pool_rejection_reason(row)
 
@@ -380,9 +482,14 @@ def write_xlsx(path: Path, rows: list[dict[str, str]], columns: list[str], sheet
 def ledger_csv_files(ledger_dir: Path) -> list[Path]:
     if not ledger_dir.exists():
         return []
+
+    def ledger_timestamp(path: Path) -> str:
+        match = re.search(r"(\d{8}_\d{6})", path.name)
+        return match.group(1) if match else ""
+
     return sorted(
-        [path for path in ledger_dir.glob("*.csv") if not path.name.startswith("~$")],
-        key=lambda path: path.stat().st_mtime,
+        [path for path in ledger_dir.glob("发票台账_*.csv") if not path.name.startswith("~$")],
+        key=ledger_timestamp,
     )
 
 
@@ -432,6 +539,7 @@ def sync_pool(
         for row in read_csv(ledger_path):
             rejection_reason = pool_rejection_reason(row)
             if rejection_reason:
+                apply_authoritative_rejection(row, rejection_reason, merged_by_key)
                 if row_value(row, "output_file", "整理后文件", "发票文件") or row_value(row, "invoice_number", "发票号码"):
                     rejected_rows.append(rejected_pool_row(row, ledger_path, rejection_reason))
                 continue
@@ -455,16 +563,7 @@ def sync_pool(
 
 
 def normalized_source_path(row: dict[str, str]) -> str:
-    source_text = str(row.get("发票文件") or "").strip()
-    if not source_text:
-        return ""
-    source = Path(source_text).expanduser()
-    if not source.is_absolute():
-        source = (WORKSPACE_ROOT / source).resolve()
-    try:
-        return str(source.resolve())
-    except OSError:
-        return str(source)
+    return normalized_file_reference(row.get("发票文件"))
 
 
 def duplicate_source_groups(rows: list[dict[str, str]]) -> list[list[dict[str, str]]]:
@@ -624,28 +723,22 @@ def invoice_copy_name(row: dict[str, str], source_text: str) -> str:
 
 
 def clear_previous_generated_files(target_root: Path) -> None:
-    manifest_path = target_root / "发票文件清单.csv"
-    if not manifest_path.exists():
+    if not target_root.exists():
         return
     try:
         target_root_resolved = target_root.resolve()
     except OSError:
         return
-    for row in read_csv(manifest_path):
-        copied_text = str(row.get("发票文件") or "").strip()
-        if not copied_text:
-            continue
-        copied = Path(copied_text).expanduser()
+    for copied in sorted([path for path in target_root.rglob("*") if path.is_file()], key=lambda path: len(path.parts), reverse=True):
         try:
             copied_resolved = copied.resolve()
             copied_resolved.relative_to(target_root_resolved)
         except (OSError, ValueError):
             continue
-        if copied_resolved.exists() and copied_resolved.is_file():
-            try:
-                copied_resolved.unlink()
-            except OSError:
-                pass
+        try:
+            copied_resolved.unlink()
+        except OSError:
+            pass
     for folder in sorted([path for path in target_root.rglob("*") if path.is_dir()], key=lambda path: len(path.parts), reverse=True):
         try:
             folder.rmdir()
@@ -986,6 +1079,7 @@ def manifest_file_issues(manifest_path: Path, *, expected_rows: int | None = Non
     if expected_rows is not None and len(rows) != expected_rows:
         issues.append({"类型": "清单数量不一致", "说明": f"清单 {len(rows)} 条，应为 {expected_rows} 条", "文件": str(manifest_path)})
     seen_paths: set[str] = set()
+    listed_paths: set[str] = set()
     for index, row in enumerate(rows, start=2):
         file_text = str(row.get("发票文件") or "").strip()
         if not file_text:
@@ -998,8 +1092,19 @@ def manifest_file_issues(manifest_path: Path, *, expected_rows: int | None = Non
         if resolved in seen_paths:
             issues.append({"类型": "清单重复文件", "说明": f"第 {index} 行重复指向同一个发票文件", "文件": resolved})
         seen_paths.add(resolved)
+        listed_paths.add(resolved)
         if not file_path.exists():
             issues.append({"类型": "清单文件不存在", "说明": f"第 {index} 行指向的发票文件不存在", "文件": resolved})
+    if manifest_path.exists():
+        for extra_path in manifest_path.parent.rglob("*"):
+            if not extra_path.is_file() or extra_path.name in {"发票文件清单.csv", "缺失文件清单.csv", ".DS_Store"}:
+                continue
+            try:
+                resolved = str(extra_path.resolve())
+            except OSError:
+                resolved = str(extra_path)
+            if resolved not in listed_paths:
+                issues.append({"类型": "清单外残留文件", "说明": "发票文件夹里有未列入当前清单的旧文件", "文件": resolved})
     return issues
 
 
