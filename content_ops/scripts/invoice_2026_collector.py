@@ -68,6 +68,8 @@ THREAD_LOCAL = threading.local()
 SUBJECT_KEYWORDS = (
     "发票",
     "电子发票",
+    "开票",
+    "开票成功",
     "电票",
     "数电票",
     "Invoice",
@@ -81,6 +83,13 @@ SUBJECT_KEYWORDS = (
     "首汽约车",
     "出行发票",
     "行程报销凭证",
+    "飞书",
+    "Feishu",
+    "Lark",
+    "飞书办公",
+    "飞书订阅",
+    "火山引擎",
+    "Volcengine",
 )
 
 PRIORITY_SENDER_DOMAINS = (
@@ -105,6 +114,14 @@ PRIORITY_SENDER_DOMAINS = (
     "railway12306.cn",
     "apple.com",
     "stripe.com",
+    "mail.bytedance.net",
+    "bytedance.net",
+    "bytedance.com",
+    "larksuite.com",
+    "feishu.cn",
+    "feishu.com",
+    "notice.volcengine.com",
+    "volcengine.com",
 )
 
 LIKELY_INVOICE_KEYWORDS = (
@@ -113,6 +130,8 @@ LIKELY_INVOICE_KEYWORDS = (
     "数电票",
     "全电票",
     "开票",
+    "开票成功",
+    "开票申请",
     "电票",
     "数电票",
     "票据",
@@ -131,6 +150,11 @@ LIKELY_INVOICE_KEYWORDS = (
     "invoice",
     "receipt",
     "tax",
+    "飞书",
+    "feishu",
+    "lark",
+    "火山引擎",
+    "volcengine",
 )
 
 DOWNLOAD_ATTACHMENT_EXTENSIONS = {".pdf", ".ofd"}
@@ -1187,6 +1211,8 @@ def detect_link_platform(url: str, sender: str = "", subject: str = "") -> str:
         return "Apple"
     if "jdcloud-oss.com" in host or "jd.com" in host:
         return "京东"
+    if "volcengine.com" in host or "火山引擎" in combined or "volcengine" in combined:
+        return "火山引擎"
     if "bytedance.com" in host or "feishu" in combined or "larksuite" in combined:
         return "飞书"
     if "fin-invoice" in host or "taobao" in combined or "淘宝" in combined:
@@ -1223,7 +1249,7 @@ def link_has_invoice_signal(candidate: dict[str, str], subject: str, sender: str
     if ext in INVOICE_EXTENSIONS or ext in ARCHIVE_EXTENSIONS:
         return True
     has_link_hint = any(hint.lower() in link_text for hint in LINK_INVOICE_HINTS)
-    if platform in {"诺诺网/JSS", "云票/百望", "百望/票通", "税务平台直链", "Apple硬件发票", "京东", "飞书", "淘宝闪购", "滴滴", "曹操出行", "T3出行", "首汽约车", "高德打车"}:
+    if platform in {"诺诺网/JSS", "云票/百望", "百望/票通", "税务平台直链", "Apple硬件发票", "京东", "飞书", "火山引擎", "淘宝闪购", "滴滴", "曹操出行", "T3出行", "首汽约车", "高德打车"}:
         return True
     if platform != "未知平台" and has_link_hint:
         return True

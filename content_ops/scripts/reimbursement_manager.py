@@ -120,6 +120,18 @@ BAD_PARTY_MARKERS = (
     "销售方信息",
 )
 
+PERSONAL_PURCHASERS = {"个人", "个人用户", "季元征", "季元徵"}
+COMPANY_PARTY_MARKERS = ("公司", "有限", "企业", "中心", "事务所", "工作室")
+TAX_INVOICE_EVIDENCE_MARKERS = (
+    "增值税",
+    "电子发票",
+    "数电",
+    "普通发票",
+    "专用发票",
+    "发票号码",
+)
+DEFAULT_REIMBURSEMENT_SUBJECTS = {"北京零克创盟广告有限公司"}
+
 
 def now_text() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -183,6 +195,40 @@ def party_quality_issue(value: object, *, allow_personal: bool = False) -> str:
     if len(normalized) < 2:
         return "主体名称过短"
     return ""
+
+
+def is_personal_purchaser(value: object) -> bool:
+    normalized = re.sub(r"\s+", "", str(value or ""))
+    return normalized in PERSONAL_PURCHASERS
+
+
+def is_company_like_party(value: object) -> bool:
+    text = str(value or "").strip()
+    normalized = re.sub(r"\s+", "", text)
+    return bool(normalized and any(marker in normalized for marker in COMPANY_PARTY_MARKERS) and not party_quality_issue(text))
+
+
+def tax_invoice_evidence(row: dict[str, str]) -> bool:
+    combined = selected_row_text(
+        row,
+        (
+            "invoice_kind",
+            "增值税类型",
+            "invoice_number",
+            "发票号码",
+            "mail_subject",
+            "邮件主题",
+            "attachment_original_name",
+            "附件原名",
+            "note",
+            "备注",
+        ),
+    )
+    return any(marker in combined for marker in TAX_INVOICE_EVIDENCE_MARKERS)
+
+
+def is_pool_row(row: dict[str, str]) -> bool:
+    return bool(row.get("发票唯一键")) or ("首次入池时间" in row and "报销状态" in row)
 
 
 def row_text(row: dict[str, str], *extra_values: object) -> str:
@@ -250,6 +296,38 @@ def looks_like_party_name(value: object) -> bool:
 
 def normalized_party_text(value: object) -> str:
     return re.sub(r"[^\w\u4e00-\u9fff]+", "", str(value or ""))
+
+
+def configured_reimbursement_subjects() -> set[str]:
+    subjects = {normalized_party_text(value) for value in DEFAULT_REIMBURSEMENT_SUBJECTS}
+    config_path = INVOICE_ROOT / "私密配置" / "reimbursement_subjects.txt"
+    if not config_path.exists():
+        return {value for value in subjects if value}
+    for line in config_path.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if text and not text.startswith("#"):
+            subjects.add(normalized_party_text(text))
+    return {value for value in subjects if value}
+
+
+def reimbursement_subjects_from_ledgers(ledger_paths: Iterable[Path]) -> set[str]:
+    invoice_numbers_by_subject: dict[str, set[str]] = {}
+    for ledger_path in ledger_paths:
+        for row in read_csv(ledger_path):
+            status = row_value(row, "status", "状态")
+            if status and status not in VALID_STATUSES:
+                continue
+            if (row_value(row, "include_in_summary", "计入汇总") or "是") == "否":
+                continue
+            purchaser = row_value(row, "purchaser", "付款方")
+            if is_company_like_party(purchaser):
+                subject = normalized_party_text(purchaser)
+                invoice_number = row_value(row, "invoice_number", "发票号码")
+                if invoice_number:
+                    invoice_numbers_by_subject.setdefault(subject, set()).add(invoice_number)
+    subjects = configured_reimbursement_subjects()
+    subjects.update(subject for subject, invoice_numbers in invoice_numbers_by_subject.items() if len(invoice_numbers) >= 3)
+    return {subject for subject in subjects if subject}
 
 
 def invoice_pdf_parties(source_text: str) -> tuple[str, str]:
@@ -320,7 +398,7 @@ def normalize_pool_parties(row: dict[str, str], source_row: dict[str, str] | Non
     return row
 
 
-def pool_rejection_reason(row: dict[str, str]) -> str:
+def pool_rejection_reason(row: dict[str, str], reimbursement_subjects: set[str] | None = None) -> str:
     status = row_value(row, "status", "状态")
     include = row_value(row, "include_in_summary", "计入汇总") or "是"
     output_file = row_value(row, "output_file", "整理后文件", "发票文件")
@@ -340,13 +418,20 @@ def pool_rejection_reason(row: dict[str, str]) -> str:
         return "Apple 个人电子收据号，不是换开后的税务发票号码"
     if not is_china_tax_invoice_number(invoice_number):
         return "缺少有效中国税务发票号码"
+    if not is_pool_row(row) and not tax_invoice_evidence(row):
+        return "缺少税务发票类型或邮件发票线索"
 
     seller = row_value(row, "seller", "收款方")
     purchaser = row_value(row, "purchaser", "付款方")
+    if is_personal_purchaser(purchaser):
+        return "付款方为个人抬头，不能进入报销导入池"
+    subjects = reimbursement_subjects or set()
+    if normalized_party_text(seller) in subjects and normalized_party_text(purchaser) not in subjects:
+        return "收款方疑似报销主体，购买方/销售方可能颠倒"
     seller_issue = party_quality_issue(seller)
     if seller_issue:
         return f"收款方{seller_issue}"
-    purchaser_issue = party_quality_issue(purchaser, allow_personal=True)
+    purchaser_issue = party_quality_issue(purchaser)
     if purchaser_issue:
         return f"付款方{purchaser_issue}"
 
@@ -366,8 +451,11 @@ def rejection_should_remove_existing_pool_row(reason: str) -> bool:
         "已标记不计入汇总",
         "Apple 个人电子收据号，不是换开后的税务发票号码",
         "缺少有效中国税务发票号码",
+        "缺少税务发票类型或邮件发票线索",
         "海外收据/外币账单，不是中国税务发票",
         "外币符号账单，不是中国税务发票",
+        "付款方为个人抬头，不能进入报销导入池",
+        "收款方疑似报销主体，购买方/销售方可能颠倒",
     }:
         return True
     if reason.startswith(("收款方", "付款方")):
@@ -414,6 +502,12 @@ def can_remove_existing_for_rejection(existing: dict[str, str], reason: str) -> 
         return False
     if reason == "缺少有效中国税务发票号码":
         return not is_china_tax_invoice_number(row_value(existing, "invoice_number", "发票号码"))
+    if reason in {
+        "缺少税务发票类型或邮件发票线索",
+        "付款方为个人抬头，不能进入报销导入池",
+        "收款方疑似报销主体，购买方/销售方可能颠倒",
+    }:
+        return True
     if reason.startswith(("收款方", "付款方")):
         return pool_rejection_reason(existing) == reason
     return True
@@ -494,6 +588,34 @@ def write_xlsx(path: Path, rows: list[dict[str, str]], columns: list[str], sheet
         df.to_excel(writer, index=False, sheet_name=sheet_name)
 
 
+def write_pool_xlsx(path: Path, rows: list[dict[str, str]], rejected_rows: list[dict[str, str]]) -> None:
+    try:
+        import pandas as pd
+        from openpyxl.styles import Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except Exception:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        pd.DataFrame(rows, columns=POOL_COLUMNS).to_excel(writer, index=False, sheet_name="累计发票池")
+        pd.DataFrame(rejected_rows, columns=REJECTION_COLUMNS).to_excel(writer, index=False, sheet_name="不入池复核")
+        workbook = writer.book
+        fills = {
+            "累计发票池": PatternFill("solid", fgColor="1F4E78"),
+            "不入池复核": PatternFill("solid", fgColor="C00000"),
+        }
+        for sheet_name, header_fill in fills.items():
+            ws = workbook[sheet_name]
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            for cell in ws[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = header_fill
+            for column_cells in ws.columns:
+                max_len = max(len(str(cell.value or "")) for cell in column_cells[:200])
+                ws.column_dimensions[get_column_letter(column_cells[0].column)].width = min(max(max_len + 2, 10), 56)
+
+
 def ledger_csv_files(ledger_dir: Path) -> list[Path]:
     if not ledger_dir.exists():
         return []
@@ -549,13 +671,15 @@ def sync_pool(
     pool_xlsx: Path = POOL_XLSX,
 ) -> list[dict[str, str]]:
     REIMBURSEMENT_ROOT.mkdir(parents=True, exist_ok=True)
+    ledger_paths = ledger_csv_files(ledger_dir)
+    reimbursement_subjects = reimbursement_subjects_from_ledgers(ledger_paths)
     existing_by_key = {row.get("发票唯一键", ""): row for row in read_csv(pool_csv) if row.get("发票唯一键")}
     merged_by_key: dict[str, dict[str, str]] = dict(existing_by_key)
     rejected_rows: list[dict[str, str]] = []
 
-    for ledger_path in ledger_csv_files(ledger_dir):
+    for ledger_path in ledger_paths:
         for row in read_csv(ledger_path):
-            rejection_reason = pool_rejection_reason(row)
+            rejection_reason = pool_rejection_reason(row, reimbursement_subjects)
             if rejection_reason:
                 apply_authoritative_rejection(row, rejection_reason, merged_by_key)
                 if should_write_rejected_pool_row(row, ledger_path, rejection_reason):
@@ -575,8 +699,8 @@ def sync_pool(
         key=lambda row: (row.get("开票日期", ""), row.get("收款方", ""), row.get("发票号码", "")),
     )
     write_csv(pool_csv, rows, POOL_COLUMNS)
-    write_xlsx(pool_xlsx, rows, POOL_COLUMNS, "累计发票池")
     write_csv(POOL_REJECTED_CSV, rejected_rows, REJECTION_COLUMNS)
+    write_pool_xlsx(pool_xlsx, rows, rejected_rows)
     return rows
 
 
